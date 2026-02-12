@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="auto">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#020617">
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" href="LogoApp.png" type="image/png">
+    <link rel="apple-touch-icon" href="LogoApp.png">
+    <title>Graficador Pro</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+        window.tailwind = window.tailwind || {};
+        window.tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif']
+                    }
+                }
+            }
+        };
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="css/estilos.css" rel="stylesheet">
+</head>
+<body class="bg-slate-950 text-slate-200 font-sans h-screen w-screen overflow-hidden flex flex-col md:flex-row select-none">
+
+    <!-- Modal de Selección de Elemento -->
+    <div id="type-selector-modal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-700 p-6 rounded-xl shadow-2xl max-w-sm w-full">
+            <h3 class="text-lg font-bold text-white mb-4 text-center">Añadir Elemento</h3>
+            <div class="grid grid-cols-2 gap-4">
+                <button onclick="addElement('function')" class="flex flex-col items-center justify-center p-4 bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-blue-500 rounded-lg transition-all group">
+                    <div class="w-12 h-12 rounded-full bg-blue-500/10 text-blue-400 flex items-center justify-center mb-2 group-hover:bg-blue-500 group-hover:text-white transition-colors">
+                        <i class="fa-solid fa-wave-square text-xl"></i>
+                    </div>
+                    <span class="text-sm font-medium">Función f(x)</span>
+                </button>
+                <button onclick="addElement('text')" class="flex flex-col items-center justify-center p-4 bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-emerald-500 rounded-lg transition-all group">
+                    <div class="w-12 h-12 rounded-full bg-emerald-500/10 text-emerald-400 flex items-center justify-center mb-2 group-hover:bg-emerald-500 group-hover:text-white transition-colors">
+                        <i class="fa-solid fa-tag text-xl"></i>
+                    </div>
+                    <span class="text-sm font-medium">Etiqueta</span>
+                </button>
+            </div>
+            <button onclick="closeModal('type-selector-modal')" class="mt-6 w-full py-3 bg-slate-800 text-slate-400 rounded hover:bg-slate-700 text-sm">Cancelar</button>
+        </div>
+    </div>
+
+    <!-- Modal de Confirmación de Limpieza -->
+    <div id="confirm-modal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-red-900/50 p-6 rounded-xl shadow-2xl max-w-sm w-full text-center">
+            <div class="w-14 h-14 bg-red-900/20 rounded-full flex items-center justify-center mx-auto mb-4 text-red-500 text-2xl">
+                <i class="fa-solid fa-triangle-exclamation"></i>
+            </div>
+            <h3 class="text-lg font-bold text-white mb-2">¿Borrar todo?</h3>
+            <p class="text-slate-400 text-sm mb-6">Esta acción eliminará todas las funciones y etiquetas del gráfico. No se puede deshacer.</p>
+            <div class="grid grid-cols-2 gap-3">
+                <button onclick="closeModal('confirm-modal')" class="py-2.5 px-4 bg-slate-800 text-white rounded-lg hover:bg-slate-700 font-medium">Cancelar</button>
+                <button onclick="executeClear()" class="py-2.5 px-4 bg-red-600 text-white rounded-lg hover:bg-red-500 font-medium shadow-lg shadow-red-900/30">Sí, Borrar</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="settings-modal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-700 p-6 rounded-xl shadow-2xl max-w-sm w-full">
+            <h3 class="text-lg font-bold text-white mb-4 text-center">Ajustes</h3>
+            <div class="space-y-3">
+                <div class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2">
+                    <input id="theme-auto" name="theme-preference" type="radio" value="auto" class="accent-blue-500">
+                    <label for="theme-auto" class="flex-1 text-sm text-slate-200">Automático</label>
+                </div>
+                <div class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2">
+                    <input id="theme-dark" name="theme-preference" type="radio" value="dark" class="accent-blue-500">
+                    <label for="theme-dark" class="flex-1 text-sm text-slate-200">Oscuro</label>
+                </div>
+                <div class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2">
+                    <input id="theme-light" name="theme-preference" type="radio" value="light" class="accent-blue-500">
+                    <label for="theme-light" class="flex-1 text-sm text-slate-200">Claro</label>
+                </div>
+            </div>
+            <button onclick="checkForUpdates()" class="mt-4 w-full py-3 bg-slate-800 text-blue-300 rounded hover:bg-slate-700 text-sm border border-slate-700">
+                <i class="fa-solid fa-arrows-rotate"></i> Buscar actualizaciones
+            </button>
+            <button onclick="closeModal('settings-modal')" class="mt-6 w-full py-3 bg-slate-800 text-slate-400 rounded hover:bg-slate-700 text-sm">Cerrar</button>
+        </div>
+    </div>
+
+    <!-- Panel Lateral / Cajón Deslizante -->
+    <div id="panel-wrapper" class="panel-glass flex-shrink-0 w-full md:w-80 h-[40%] md:h-full z-20 flex flex-col border-r border-slate-800 relative group">
+        
+        <!-- Contenido Panel -->
+        <div class="flex-1 flex flex-col overflow-hidden">
+            <!-- Header -->
+            <div class="p-3 border-b border-slate-800 flex justify-between items-center">
+                <h1 class="text-base font-bold text-blue-400 flex items-center gap-2">
+                    <i class="fa-solid fa-chart-line"></i> Graficador Pro
+                </h1>
+                <div class="md:hidden text-xs text-slate-600"><i class="fa-solid fa-grip-lines"></i></div>
+            </div>
+
+            <!-- Lista -->
+            <div class="flex-1 overflow-y-auto p-2 space-y-2 custom-scroll" id="elements-container"></div>
+
+            <!-- Botonera -->
+            <div class="p-2 border-t border-slate-800 space-y-2 pb-1 md:mt-auto">
+                <button onclick="openModal('type-selector-modal')" class="w-full py-3 px-4 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-all font-medium flex items-center justify-center gap-2 shadow-lg shadow-blue-900/20 text-sm active:scale-95">
+                    <i class="fa-solid fa-plus"></i> Añadir
+                </button>
+                <div class="grid grid-cols-2 gap-2">
+                    <button onclick="resetView()" class="py-2 px-3 bg-slate-800 text-slate-400 hover:text-white rounded text-xs border border-slate-700 active:bg-slate-700">
+                        <i class="fa-solid fa-compress"></i> Centrar
+                    </button>
+                    <button onclick="confirmClear()" class="py-2 px-3 bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded text-xs border border-red-500/20 active:bg-red-900/30">
+                        <i class="fa-solid fa-trash"></i> Limpiar
+                    </button>
+                </div>
+                <button onclick="downloadGraph()" class="btn-panel w-full py-2.5 px-4 bg-slate-800 text-slate-300 hover:text-white rounded text-xs border border-slate-700 flex items-center justify-center gap-2 active:bg-slate-700">
+                    <i class="fa-solid fa-download"></i> Descargar
+                </button>
+                <button onclick="openModal('settings-modal')" class="btn-panel w-full py-2.5 px-4 bg-slate-800 text-slate-300 hover:text-white rounded text-xs border border-slate-700 flex items-center justify-center gap-2 active:bg-slate-700">
+                    <i class="fa-solid fa-gear"></i> Ajustes
+                </button>
+            </div>
+        </div>
+
+        <!-- Handle Móvil -->
+        <div id="drag-handle" class="md:hidden w-full h-7 panel-glass flex items-center justify-center cursor-row-resize touch-none border-t border-slate-700 shadow-lg z-30">
+            <div class="w-16 h-1 bg-slate-500 rounded-full"></div>
+            <i id="handle-icon" class="fa-solid fa-chevron-up text-[10px] text-slate-500 ml-2 transition-transform duration-300"></i>
+        </div>
+    </div>
+
+    <!-- Área Principal -->
+    <main class="flex-1 relative w-full bg-slate-950 overflow-hidden flex flex-col">
+        <div class="absolute top-4 right-4 bg-slate-900/80 backdrop-blur border border-slate-700 rounded px-3 py-1.5 shadow-lg pointer-events-none select-none z-10 font-sans text-xs text-blue-300 flex gap-3">
+            <span>X: <span id="coord-x" class="text-white">0.00</span></span>
+            <span>Y: <span id="coord-y" class="text-white">0.00</span></span>
+        </div>
+
+        <canvas id="graphCanvas" class="block w-full h-full cursor-crosshair touch-none"></canvas>
+        
+        <div class="absolute bottom-6 right-6 flex flex-col gap-3 md:hidden z-30 pointer-events-auto">
+            <button onclick="zoomIn()" class="w-12 h-12 rounded-full bg-slate-800/90 border border-slate-600 text-blue-400 shadow-xl flex items-center justify-center text-xl active:bg-slate-700 backdrop-blur"><i class="fa-solid fa-plus"></i></button>
+            <button onclick="zoomOut()" class="w-12 h-12 rounded-full bg-slate-800/90 border border-slate-600 text-blue-400 shadow-xl flex items-center justify-center text-xl active:bg-slate-700 backdrop-blur"><i class="fa-solid fa-minus"></i></button>
+        </div>
+    </main>
+
+<script src="js/app.js"></script>
+<script src="js/paginas/index.js"></script>
+</body>
+</html>
