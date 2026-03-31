@@ -83,6 +83,24 @@
                     <label for="theme-light" class="flex-1 text-sm text-slate-200">Claro</label>
                 </div>
             </div>
+            <div class="mt-3 border-t border-slate-700 pt-3 space-y-2">
+                <p class="text-xs text-slate-500 font-bold uppercase">Puntos de referencia</p>
+                <div class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2">
+                    <input id="show-ref-points" type="checkbox" class="accent-blue-500" onchange="onShowRefPointsChange(this.checked)">
+                    <label for="show-ref-points" class="flex-1 text-sm text-slate-200">Mostrar puntos (■ ◇)</label>
+                </div>
+            </div>
+            <div class="mt-3 border-t border-slate-700 pt-3 space-y-2">
+                <p class="text-xs text-slate-500 font-bold uppercase">Coordenadas visibles</p>
+                <div class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2">
+                    <input id="show-axis-coords" type="checkbox" class="accent-blue-500" onchange="onShowAxisCoordsChange(this.checked)">
+                    <label for="show-axis-coords" class="flex-1 text-sm text-slate-200">Cruces con los ejes</label>
+                </div>
+                <div class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2">
+                    <input id="show-ref-coords" type="checkbox" class="accent-blue-500" onchange="onShowRefCoordsChange(this.checked)">
+                    <label for="show-ref-coords" class="flex-1 text-sm text-slate-200">Puntos de referencia</label>
+                </div>
+            </div>
             <button onclick="checkForUpdates()" class="mt-4 w-full py-3 bg-slate-800 text-blue-300 rounded hover:bg-slate-700 text-sm border border-slate-700">
                 <i class="fa-solid fa-arrows-rotate"></i> Buscar actualizaciones
             </button>

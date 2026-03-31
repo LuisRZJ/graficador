@@ -380,9 +380,10 @@ function parsePiecewise(input) {
 
 function parseParametric(input) {
     const text = normalizeInput(input);
-    const stop = String.raw`(?=,|;|\bx\s*=|\by\s*=|\bt\s*in\b|\btheta\s*in\b|$)`;
-    const xMatch = new RegExp(String.raw`\bx\s*=\s*(.+?)${stop}`, 'i').exec(text);
-    const yMatch = new RegExp(String.raw`\by\s*=\s*(.+?)${stop}`, 'i').exec(text);
+    const stop = String.raw`(?=,|;|\bx\s*[\(]?(?:t|theta)?\s*[\)]?\s*=|\by\s*[\(]?(?:t|theta)?\s*[\)]?\s*=|\bt\s*in\b|\btheta\s*in\b|$)`;
+    // Accept both "x = expr" and "x(t) = expr" / "x(θ) = expr"
+    const xMatch = new RegExp(String.raw`\bx\s*(?:\(\s*(?:t|theta)\s*\))?\s*=\s*(.+?)${stop}`, 'i').exec(text);
+    const yMatch = new RegExp(String.raw`\by\s*(?:\(\s*(?:t|theta)\s*\))?\s*=\s*(.+?)${stop}`, 'i').exec(text);
     if (!xMatch || !yMatch) return null;
     const range = parseRange(text, 't') || parseRange(text, 'theta');
     const tMinExpr = range ? range[0] : '-10';
@@ -400,7 +401,7 @@ function parseParametric(input) {
 
 function parsePolar(input) {
     const text = normalizeInput(input);
-    const rMatch = /r\s*=\s*([^,;]+)/i.exec(text);
+    const rMatch = /\br\s*=\s*([^,;]+)/i.exec(text);
     if (!rMatch) return null;
     const range = parseRange(text, 'theta') || parseRange(text, 't');
     const thetaMinExpr = range ? range[0] : '0';
@@ -472,11 +473,14 @@ function parseImplicit(input) {
     const text = normalizeInput(input);
     if (/^\s*r\s*=/.test(text)) return null;
     if (!text.includes('=')) return null;
-    const parts = text.split('=');
-    if (parts.length < 2) return null;
-    const left = parts[0].trim();
-    const right = parts.slice(1).join('=').trim();
+    const eqIndex = text.indexOf('=');
+    const left = text.slice(0, eqIndex).trim();
+    const right = text.slice(eqIndex + 1).trim();
     if (!left || !right) return null;
+
+    // If both sides are free of x and y, this is not a planar equation
+    const hasXY = (s) => /\bx\b/i.test(s) || /\by\b/i.test(s);
+    if (!hasXY(left) && !hasXY(right)) return null;
 
     const isLeftJustY = /^y$/i.test(left.replace(/\s+/g, ''));
     if (isLeftJustY && !/\by\b/i.test(right)) return null;
@@ -647,6 +651,36 @@ function init() {
     }
 }
 
+const SHOW_AXIS_COORDS_KEY = 'graficador.showAxisCoords.v1';
+const SHOW_REF_COORDS_KEY = 'graficador.showRefCoords.v1';
+const SHOW_REF_POINTS_KEY = 'graficador.showRefPoints.v1';
+let showAxisCoords = false;
+let showRefCoords = false;
+let showRefPoints = false;
+
+function loadBoolKey(key) {
+    try { return sessionStorage.getItem(key) === 'true'; } catch { return false; }
+}
+function saveBoolKey(key, val) {
+    try { sessionStorage.setItem(key, val ? 'true' : 'false'); } catch {}
+}
+
+window.onShowAxisCoordsChange = (checked) => {
+    showAxisCoords = !!checked;
+    saveBoolKey(SHOW_AXIS_COORDS_KEY, showAxisCoords);
+    scheduleDrawFrame();
+};
+window.onShowRefCoordsChange = (checked) => {
+    showRefCoords = !!checked;
+    saveBoolKey(SHOW_REF_COORDS_KEY, showRefCoords);
+    scheduleDrawFrame();
+};
+window.onShowRefPointsChange = (checked) => {
+    showRefPoints = !!checked;
+    saveBoolKey(SHOW_REF_POINTS_KEY, showRefPoints);
+    scheduleDrawFrame();
+};
+
 function initThemeSettings() {
     const inputs = Array.from(document.querySelectorAll('input[name="theme-preference"]'));
     if (inputs.length === 0) return;
@@ -663,6 +697,16 @@ function initThemeSettings() {
             window.App.Theme.setThemePreference(input.value);
         });
     }
+
+    showAxisCoords = loadBoolKey(SHOW_AXIS_COORDS_KEY);
+    showRefCoords = loadBoolKey(SHOW_REF_COORDS_KEY);
+    showRefPoints = loadBoolKey(SHOW_REF_POINTS_KEY);
+    const axisCheckbox = document.getElementById('show-axis-coords');
+    if (axisCheckbox) axisCheckbox.checked = showAxisCoords;
+    const refCheckbox = document.getElementById('show-ref-coords');
+    if (refCheckbox) refCheckbox.checked = showRefCoords;
+    const refPointsCheckbox = document.getElementById('show-ref-points');
+    if (refPointsCheckbox) refPointsCheckbox.checked = showRefPoints;
 }
 
 function resizeCanvas(shouldDraw = true) {
@@ -813,6 +857,7 @@ let implicitCanvas = null;
 let implicitCtx = null;
 let implicitJobs = [];
 let implicitTextElements = [];
+let implicitMarkerElements = [];
 
 function cancelImplicitRender() {
     implicitRenderToken += 1;
@@ -926,6 +971,7 @@ function runImplicitRender(token) {
 
     ctx.drawImage(implicitCanvas, 0, 0);
     implicitTextElements.forEach(drawTextMarker);
+    implicitMarkerElements.forEach(({ intersections, color }) => drawIntersectionMarkers(intersections, color));
 
     if (!implicitJobs.length) {
         implicitRenderFrameId = 0;
@@ -946,12 +992,31 @@ function draw() {
     const implicitQueue = [];
     elements.filter(e => e.type === 'function' && e.visible).forEach((el) => drawGraphElement(el, implicitQueue));
     const textEls = elements.filter(e => e.type === 'text' && e.visible);
+
+    elements.filter(e => e.type === 'function' && e.visible).forEach((el) => {
+        if (!el.content.trim()) return;
+        const compiled = getCompiledElement(el);
+        if (!compiled) return;
+        if (compiled.type === 'function') {
+            drawIntersectionMarkers(findCartesianIntersections(compiled.fn), el.color);
+            drawKeyReferencePoints(compiled.fn, el.color);
+        } else if (compiled.type === 'parametric' || compiled.type === 'segments') {
+            drawIntersectionMarkers(findParametricAxisIntersections(compiled), el.color);
+        } else if (compiled.type === 'polar') {
+            drawIntersectionMarkers(findPolarAxisIntersections(compiled), el.color);
+        }
+    });
+
     textEls.forEach(drawTextMarker);
 
     if (implicitQueue.length) {
         ensureImplicitCanvas();
         implicitJobs = implicitQueue.map(({ compiled, color }) => createImplicitJob(compiled, color));
         implicitTextElements = textEls;
+        implicitMarkerElements = implicitQueue.map(({ compiled, color }) => ({
+            intersections: findImplicitAxisIntersections(compiled.fn),
+            color
+        }));
         const token = implicitRenderToken;
         implicitRenderFrameId = window.requestAnimationFrame(() => runImplicitRender(token));
     }
@@ -1004,6 +1069,495 @@ function drawCartesianFunction(compiled, color) {
         lastScreenY = screenY;
     }
     ctx.stroke();
+}
+
+function bisect(fn, a, b, fa, fb) {
+    for (let iter = 0; iter < 60; iter++) {
+        const mid = (a + b) / 2;
+        let fm;
+        try { fm = fn(mid); } catch { return null; }
+        if (!isFinite(fm)) return null;
+        if (Math.abs(b - a) < 1e-10) return mid;
+        if (fa * fm <= 0) { b = mid; fb = fm; }
+        else { a = mid; fa = fm; }
+    }
+    return (a + b) / 2;
+}
+
+function findCartesianIntersections(fn) {
+    const minX = screenToWorldX(0);
+    const maxX = screenToWorldX(canvas.width);
+    const SAMPLES = 600;
+    const step = (maxX - minX) / SAMPLES;
+    const MAX_ROOTS = 15;
+    const xIntercepts = [];
+
+    // Pre-sample all values
+    const xs = new Float64Array(SAMPLES + 1);
+    const ys = new Float64Array(SAMPLES + 1);
+    for (let i = 0; i <= SAMPLES; i++) {
+        xs[i] = minX + i * step;
+        try { ys[i] = fn(xs[i]); } catch { ys[i] = NaN; }
+    }
+
+    // Pass 1: sign-change roots (odd multiplicity)
+    for (let i = 0; i < SAMPLES && xIntercepts.length < MAX_ROOTS; i++) {
+        if (!isFinite(ys[i]) || !isFinite(ys[i + 1])) continue;
+        if (ys[i] * ys[i + 1] >= 0) continue;
+        const root = bisect(fn, xs[i], xs[i + 1], ys[i], ys[i + 1]);
+        if (root === null || !isFinite(root)) continue;
+        if (!xIntercepts.some(p => Math.abs(p.x - root) < step * 0.5)) {
+            xIntercepts.push({ x: root, y: 0, tangent: false });
+        }
+    }
+
+    // Pass 2: tangent zeros (even multiplicity — touches but does not cross)
+    // Condition: local minimum of |f| where the minimum is much smaller than
+    // its neighbors (scale-invariant: aym*8 < ayl+ayr).
+    for (let i = 1; i < SAMPLES && xIntercepts.length < MAX_ROOTS; i++) {
+        const ayl = Math.abs(ys[i - 1]);
+        const aym = Math.abs(ys[i]);
+        const ayr = Math.abs(ys[i + 1]);
+        if (!isFinite(ayl) || !isFinite(aym) || !isFinite(ayr)) continue;
+        if (aym >= ayl || aym >= ayr) continue;       // not a local min
+        if (aym * 8 >= ayl + ayr) continue;           // not sharp enough
+        if (xIntercepts.some(p => Math.abs(p.x - xs[i]) < step * 2)) continue;
+        // Parabolic interpolation to refine x
+        const denom = ayl - 2 * aym + ayr;
+        const xTouch = Math.abs(denom) > 1e-30
+            ? xs[i] - step * (ayr - ayl) / (2 * denom)
+            : xs[i];
+        xIntercepts.push({ x: xTouch, y: 0, tangent: true });
+    }
+
+    let yIntercept = null;
+    const originScreenX = worldToScreenX(0);
+    if (originScreenX >= 0 && originScreenX <= canvas.width) {
+        try {
+            const yVal = fn(0);
+            if (isFinite(yVal)) yIntercept = { x: 0, y: yVal };
+        } catch {}
+    }
+
+    return { xIntercepts, yIntercept };
+}
+
+function findParametricAxisIntersections(compiled) {
+    const segs = compiled.type === 'segments' ? compiled.segments
+               : compiled.type === 'parametric' ? [compiled]
+               : [];
+    const allPoints = [];
+    const SAMPLES = 500;
+    const DEDUP = 1e-3;
+
+    for (const seg of segs) {
+        if (!seg.xFn || !seg.yFn || !isFinite(seg.tMin) || !isFinite(seg.tMax)) continue;
+        const { xFn, yFn, tMin, tMax } = seg;
+        const dt = (tMax - tMin) / SAMPLES;
+        let prevT = tMin;
+        let prevX, prevY;
+        try { prevX = xFn({ t: tMin }); prevY = yFn({ t: tMin }); } catch { continue; }
+        if (!isFinite(prevX)) prevX = NaN;
+        if (!isFinite(prevY)) prevY = NaN;
+
+        const AX_EPS = 1e-9;
+
+        // Check start/end boundary points that land exactly on an axis
+        const checkBoundaryPoint = (bx, by) => {
+            if (!isFinite(bx) || !isFinite(by)) return;
+            if (Math.abs(by) <= AX_EPS && !allPoints.some(p => Math.abs(p.x - bx) < DEDUP && Math.abs(p.y) < DEDUP))
+                allPoints.push({ x: bx, y: 0, tangent: false });
+            if (Math.abs(bx) <= AX_EPS && !allPoints.some(p => Math.abs(p.x) < DEDUP && Math.abs(p.y - by) < DEDUP))
+                allPoints.push({ x: 0, y: by, tangent: false });
+        };
+        checkBoundaryPoint(prevX, prevY);        // tMin
+
+        for (let i = 1; i <= SAMPLES; i++) {
+            const t = tMin + i * dt;
+            let cx, cy;
+            try { cx = xFn({ t }); cy = yFn({ t }); } catch { cx = NaN; cy = NaN; }
+
+            // X-axis crossing: y changes sign
+            if (isFinite(prevY) && isFinite(cy) && prevY * cy < 0) {
+                const tRoot = bisect((tt) => yFn({ t: tt }), prevT, t, prevY, cy);
+                if (tRoot !== null) {
+                    let rx;
+                    try { rx = xFn({ t: tRoot }); } catch { rx = NaN; }
+                    if (isFinite(rx) && !allPoints.some(p => Math.abs(p.x - rx) < DEDUP && Math.abs(p.y) < DEDUP)) {
+                        allPoints.push({ x: rx, y: 0, tangent: false });
+                    }
+                }
+            }
+
+            // Y-axis crossing: x changes sign
+            if (isFinite(prevX) && isFinite(cx) && prevX * cx < 0) {
+                const tRoot = bisect((tt) => xFn({ t: tt }), prevT, t, prevX, cx);
+                if (tRoot !== null) {
+                    let ry;
+                    try { ry = yFn({ t: tRoot }); } catch { ry = NaN; }
+                    if (isFinite(ry) && !allPoints.some(p => Math.abs(p.x) < DEDUP && Math.abs(p.y - ry) < DEDUP)) {
+                        allPoints.push({ x: 0, y: ry, tangent: false });
+                    }
+                }
+            }
+
+            prevT = t; prevX = cx; prevY = cy;
+        }
+
+        // tMax boundary
+        checkBoundaryPoint(prevX, prevY);
+    }
+    return { xIntercepts: allPoints, yIntercept: null };
+}
+
+function findPolarAxisIntersections(compiled) {
+    const { rFn, thetaMin, thetaMax } = compiled;
+    if (!isFinite(thetaMin) || !isFinite(thetaMax)) return { xIntercepts: [], yIntercept: null };
+    const SAMPLES = 500;
+    const DEDUP = 1e-3;
+    const dt = (thetaMax - thetaMin) / SAMPLES;
+    const allPoints = [];
+
+    const xAt = (theta) => { try { const r = rFn({ theta }); return isFinite(r) ? r * Math.cos(theta) : NaN; } catch { return NaN; } };
+    const yAt = (theta) => { try { const r = rFn({ theta }); return isFinite(r) ? r * Math.sin(theta) : NaN; } catch { return NaN; } };
+
+    const AX_EPS = 1e-9;
+    const checkBoundaryPolar = (bx, by) => {
+        if (!isFinite(bx) || !isFinite(by)) return;
+        if (Math.abs(by) <= AX_EPS && !allPoints.some(p => Math.abs(p.x - bx) < DEDUP && Math.abs(p.y) < DEDUP))
+            allPoints.push({ x: bx, y: 0, tangent: false });
+        if (Math.abs(bx) <= AX_EPS && !allPoints.some(p => Math.abs(p.x) < DEDUP && Math.abs(p.y - by) < DEDUP))
+            allPoints.push({ x: 0, y: by, tangent: false });
+    };
+
+    let prevT = thetaMin;
+    let prevX = xAt(thetaMin);
+    let prevY = yAt(thetaMin);
+    checkBoundaryPolar(prevX, prevY);    // thetaMin
+
+    for (let i = 1; i <= SAMPLES; i++) {
+        const theta = thetaMin + i * dt;
+        const cx = xAt(theta);
+        const cy = yAt(theta);
+
+        if (isFinite(prevY) && isFinite(cy) && prevY * cy < 0) {
+            const tRoot = bisect(yAt, prevT, theta, prevY, cy);
+            if (tRoot !== null) {
+                const rx = xAt(tRoot);
+                if (isFinite(rx) && !allPoints.some(p => Math.abs(p.x - rx) < DEDUP && Math.abs(p.y) < DEDUP)) {
+                    allPoints.push({ x: rx, y: 0, tangent: false });
+                }
+            }
+        }
+
+        if (isFinite(prevX) && isFinite(cx) && prevX * cx < 0) {
+            const tRoot = bisect(xAt, prevT, theta, prevX, cx);
+            if (tRoot !== null) {
+                const ry = yAt(tRoot);
+                if (isFinite(ry) && !allPoints.some(p => Math.abs(p.x) < DEDUP && Math.abs(p.y - ry) < DEDUP)) {
+                    allPoints.push({ x: 0, y: ry, tangent: false });
+                }
+            }
+        }
+
+        prevT = theta; prevX = cx; prevY = cy;
+    }
+
+    checkBoundaryPolar(prevX, prevY);    // thetaMax
+    return { xIntercepts: allPoints, yIntercept: null };
+}
+
+function findImplicitAxisIntersections(fn) {
+    const minX = screenToWorldX(0);
+    const maxX = screenToWorldX(canvas.width);
+    const minY = screenToWorldY(canvas.height);
+    const maxY = screenToWorldY(0);
+    const SAMPLES = 600;
+    const MAX_ROOTS = 15;
+    const DEDUP = 1e-3;
+    const allPoints = [];
+
+    // X-axis intersections: sample f(x, 0)
+    const stepX = (maxX - minX) / SAMPLES;
+    const fxSlice = (x) => { try { return fn({ x, y: 0 }); } catch { return NaN; } };
+    let prevFx = fxSlice(minX);
+    for (let i = 1; i <= SAMPLES && allPoints.length < MAX_ROOTS; i++) {
+        const x = minX + i * stepX;
+        const fx = fxSlice(x);
+        if (isFinite(prevFx) && isFinite(fx) && prevFx * fx < 0) {
+            const root = bisect(fxSlice, x - stepX, x, prevFx, fx);
+            if (root !== null && isFinite(root)) {
+                if (!allPoints.some(p => Math.abs(p.x - root) < DEDUP && Math.abs(p.y) < DEDUP))
+                    allPoints.push({ x: root, y: 0, tangent: false });
+            }
+        }
+        prevFx = fx;
+    }
+
+    // Y-axis intersections: sample f(0, y)
+    const stepY = (maxY - minY) / SAMPLES;
+    const fySlice = (y) => { try { return fn({ x: 0, y }); } catch { return NaN; } };
+    let prevFy = fySlice(minY);
+    for (let i = 1; i <= SAMPLES && allPoints.length < MAX_ROOTS * 2; i++) {
+        const y = minY + i * stepY;
+        const fy = fySlice(y);
+        if (isFinite(prevFy) && isFinite(fy) && prevFy * fy < 0) {
+            const root = bisect(fySlice, y - stepY, y, prevFy, fy);
+            if (root !== null && isFinite(root)) {
+                if (!allPoints.some(p => Math.abs(p.x) < DEDUP && Math.abs(p.y - root) < DEDUP))
+                    allPoints.push({ x: 0, y: root, tangent: false });
+            }
+        }
+        prevFy = fy;
+    }
+
+    return { xIntercepts: allPoints, yIntercept: null };
+}
+
+function formatCoord(n) {
+    if (!isFinite(n)) return '?';
+    if (Math.abs(n) < 1e-9) return '0';
+    return parseFloat(n.toFixed(4)).toString();
+}
+
+function drawIntersectionMarkers(intersections, color) {
+    const { xIntercepts, yIntercept } = intersections;
+    const isDark = getResolvedTheme() === 'dark';
+
+    const allPoints = [...xIntercepts];
+    if (yIntercept) {
+        const alreadyPresent = allPoints.some(
+            p => Math.abs(p.x - yIntercept.x) < 1e-6 && Math.abs(p.y - yIntercept.y) < 1e-6
+        );
+        if (!alreadyPresent) allPoints.push(yIntercept);
+    }
+
+    if (!allPoints.length) return;
+
+    ctx.save();
+    ctx.font = "bold 11px 'Inter', ui-sans-serif, system-ui, sans-serif";
+
+    for (const pt of allPoints) {
+        const sx = worldToScreenX(pt.x);
+        const sy = worldToScreenY(pt.y);
+
+        if (sx < -30 || sx > canvas.width + 30 || sy < -30 || sy > canvas.height + 30) continue;
+
+        ctx.beginPath();
+        ctx.arc(sx, sy, 5, 0, Math.PI * 2);
+        if (pt.tangent) {
+            // Tangent root (touches axis): hollow circle with colored border
+            ctx.fillStyle = isDark ? '#020617' : '#f8fafc';
+            ctx.fill();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        } else {
+            // Crossing root: solid filled circle
+            ctx.fillStyle = color;
+            ctx.fill();
+            ctx.strokeStyle = isDark ? '#f8fafc' : '#0f172a';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
+
+        if (showAxisCoords) {
+            const label = `(${formatCoord(pt.x)}, ${formatCoord(pt.y)})`;
+            const tw = ctx.measureText(label).width;
+            const ph = 7;
+            const bw = tw + ph * 2;
+            const bh = 20;
+
+            let lx = sx + 9;
+            let ly = sy - bh - 8;
+            if (lx + bw > canvas.width - 5) lx = sx - bw - 9;
+            if (ly < 5) ly = sy + 10;
+            if (lx < 5) lx = 5;
+
+            const bgColor = isDark ? 'rgba(2,6,23,0.9)' : 'rgba(255,255,255,0.93)';
+            const textColor = isDark ? '#e2e8f0' : '#0f172a';
+
+            ctx.fillStyle = bgColor;
+            ctx.beginPath();
+            ctx.roundRect(lx, ly, bw, bh, 4);
+            ctx.fill();
+
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            ctx.fillStyle = textColor;
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(label, lx + ph, ly + bh / 2);
+        }
+    }
+
+    ctx.restore();
+}
+
+function numericalDerivative(fn, x) {
+    const h = 1e-5;
+    try {
+        const yp = fn(x + h);
+        const ym = fn(x - h);
+        if (!isFinite(yp) || !isFinite(ym)) return NaN;
+        return (yp - ym) / (2 * h);
+    } catch { return NaN; }
+}
+
+function numericalSecondDerivative(fn, x) {
+    const h = 1e-5;
+    try {
+        const yp = fn(x + h);
+        const y0 = fn(x);
+        const ym = fn(x - h);
+        if (!isFinite(yp) || !isFinite(y0) || !isFinite(ym)) return NaN;
+        return (yp - 2 * y0 + ym) / (h * h);
+    } catch { return NaN; }
+}
+
+function findCriticalPoints(fn) {
+    const minX = screenToWorldX(0);
+    const maxX = screenToWorldX(canvas.width);
+    const SAMPLES = 500;
+    const step = (maxX - minX) / SAMPLES;
+    const MAX_POINTS = 20;
+    const results = [];
+    let prevX = minX;
+    let prevD = numericalDerivative(fn, prevX);
+    for (let i = 1; i <= SAMPLES && results.length < MAX_POINTS; i++) {
+        const x = minX + i * step;
+        const d = numericalDerivative(fn, x);
+        if (isFinite(prevD) && isFinite(d) && prevD * d < 0) {
+            let a = prevX, b = x, fa = prevD;
+            for (let iter = 0; iter < 50; iter++) {
+                const mid = (a + b) / 2;
+                if (Math.abs(b - a) < 1e-10) break;
+                const fm = numericalDerivative(fn, mid);
+                if (!isFinite(fm)) break;
+                if (fa * fm <= 0) { b = mid; } else { a = mid; fa = fm; }
+            }
+            const cx = (a + b) / 2;
+            if (!results.some(p => Math.abs(p.x - cx) < step * 0.5)) {
+                let cy;
+                try { cy = fn(cx); } catch { cy = NaN; }
+                if (isFinite(cy)) {
+                    const d2 = numericalSecondDerivative(fn, cx);
+                    const kind = isFinite(d2) && d2 < 0 ? 'max' : 'min';
+                    results.push({ x: cx, y: cy, kind });
+                }
+            }
+        }
+        prevX = x;
+        prevD = d;
+    }
+    return results;
+}
+
+function findInflectionPoints(fn) {
+    const minX = screenToWorldX(0);
+    const maxX = screenToWorldX(canvas.width);
+    const SAMPLES = 500;
+    const step = (maxX - minX) / SAMPLES;
+    const MAX_POINTS = 20;
+    const results = [];
+    let prevX = minX;
+    let prevD2 = numericalSecondDerivative(fn, prevX);
+    for (let i = 1; i <= SAMPLES && results.length < MAX_POINTS; i++) {
+        const x = minX + i * step;
+        const d2 = numericalSecondDerivative(fn, x);
+        if (isFinite(prevD2) && isFinite(d2) && prevD2 * d2 < 0) {
+            let a = prevX, b = x, fa = prevD2;
+            for (let iter = 0; iter < 50; iter++) {
+                const mid = (a + b) / 2;
+                if (Math.abs(b - a) < 1e-10) break;
+                const fm = numericalSecondDerivative(fn, mid);
+                if (!isFinite(fm)) break;
+                if (fa * fm <= 0) { b = mid; } else { a = mid; fa = fm; }
+            }
+            const ix = (a + b) / 2;
+            if (!results.some(p => Math.abs(p.x - ix) < step * 0.5)) {
+                let iy;
+                try { iy = fn(ix); } catch { iy = NaN; }
+                if (isFinite(iy)) results.push({ x: ix, y: iy });
+            }
+        }
+        prevX = x;
+        prevD2 = d2;
+    }
+    return results;
+}
+
+function drawRefLabel(sx, sy, label, color, isDark, preferSide) {
+    const tw = ctx.measureText(label).width;
+    const ph = 7;
+    const bw = tw + ph * 2;
+    const bh = 20;
+    let lx, ly;
+    if (preferSide === 'above') { lx = sx - bw / 2; ly = sy - bh - 10; }
+    else if (preferSide === 'below') { lx = sx - bw / 2; ly = sy + 10; }
+    else { lx = sx + 9; ly = sy - bh / 2; }
+    if (lx < 5) lx = 5;
+    if (lx + bw > canvas.width - 5) lx = canvas.width - bw - 5;
+    if (ly < 5) ly = sy + 10;
+    if (ly + bh > canvas.height - 5) ly = sy - bh - 5;
+    const bgColor = isDark ? 'rgba(2,6,23,0.9)' : 'rgba(255,255,255,0.93)';
+    const textColor = isDark ? '#e2e8f0' : '#0f172a';
+    ctx.fillStyle = bgColor;
+    ctx.beginPath();
+    ctx.roundRect(lx, ly, bw, bh, 4);
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = textColor;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, lx + ph, ly + bh / 2);
+}
+
+function drawKeyReferencePoints(fn, color) {
+    if (!showRefPoints) return;
+    const criticals = findCriticalPoints(fn);
+    const inflections = findInflectionPoints(fn);
+    if (!criticals.length && !inflections.length) return;
+    const isDark = getResolvedTheme() === 'dark';
+    ctx.save();
+    ctx.font = "bold 11px 'Inter', ui-sans-serif, system-ui, sans-serif";
+    // Critical points: filled square (■)
+    for (const pt of criticals) {
+        const sx = worldToScreenX(pt.x);
+        const sy = worldToScreenY(pt.y);
+        if (sx < -20 || sx > canvas.width + 20 || sy < -20 || sy > canvas.height + 20) continue;
+        const r = 4.5;
+        ctx.fillStyle = color;
+        ctx.fillRect(sx - r, sy - r, r * 2, r * 2);
+        ctx.strokeStyle = isDark ? '#f8fafc' : '#0f172a';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(sx - r, sy - r, r * 2, r * 2);
+        if (showRefCoords) drawRefLabel(sx, sy, `(${formatCoord(pt.x)}, ${formatCoord(pt.y)})`, color, isDark, pt.kind === 'max' ? 'above' : 'below');
+    }
+    // Inflection points: diamond (◇)
+    for (const pt of inflections) {
+        const sx = worldToScreenX(pt.x);
+        const sy = worldToScreenY(pt.y);
+        if (sx < -20 || sx > canvas.width + 20 || sy < -20 || sy > canvas.height + 20) continue;
+        const r = 5;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy - r);
+        ctx.lineTo(sx + r, sy);
+        ctx.lineTo(sx, sy + r);
+        ctx.lineTo(sx - r, sy);
+        ctx.closePath();
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.strokeStyle = isDark ? '#f8fafc' : '#0f172a';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        if (showRefCoords) drawRefLabel(sx, sy, `(${formatCoord(pt.x)}, ${formatCoord(pt.y)})`, color, isDark, 'right');
+    }
+    ctx.restore();
 }
 
 function drawParametric(compiled, color) {
@@ -1278,6 +1832,20 @@ function renderExportFrame() {
 
     functionEls.forEach(drawGraphElementSync);
 
+    functionEls.forEach((el) => {
+        if (!el.content.trim()) return;
+        const compiled = getCompiledElement(el);
+        if (!compiled) return;
+        if (compiled.type === 'function') {
+            drawIntersectionMarkers(findCartesianIntersections(compiled.fn), el.color);
+            drawKeyReferencePoints(compiled.fn, el.color);
+        } else if (compiled.type === 'parametric' || compiled.type === 'segments') {
+            drawIntersectionMarkers(findParametricAxisIntersections(compiled), el.color);
+        } else if (compiled.type === 'polar') {
+            drawIntersectionMarkers(findPolarAxisIntersections(compiled), el.color);
+        }
+    });
+
     textEls.forEach(drawTextMarker);
 }
 
@@ -1349,5 +1917,6 @@ function formatNumber(n) { return Number.isInteger(n) ? n.toString() : n.toFixed
 function worldToScreenX(wx) { return (wx * state.scale) + state.offsetX; }
 function worldToScreenY(wy) { return state.offsetY - (wy * state.scale); }
 function screenToWorldX(sx) { return (sx - state.offsetX) / state.scale; }
+function screenToWorldY(sy) { return (state.offsetY - sy) / state.scale; }
 
 init();
