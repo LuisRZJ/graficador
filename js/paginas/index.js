@@ -43,13 +43,21 @@ dragHandle.addEventListener('click', () => {
 
 const canvas = document.getElementById('graphCanvas');
 const ctx = canvas.getContext('2d');
+const axisResetButton = document.getElementById('axis-reset-button');
 
 let state = {
-    scale: 40,
+    scaleX: 40,
+    scaleY: 40,
     offsetX: 0,
     offsetY: 0,
     isDraggingCanvas: false,
     draggingElementId: null,
+    isAxisScaling: false,
+    axisScaleMode: null,
+    axisScaleStartX: 40,
+    axisScaleStartY: 40,
+    axisScalePointerStart: 0,
+    axisScaleMoved: false,
     lastMouseX: 0,
     lastMouseY: 0
 };
@@ -61,6 +69,10 @@ let elements = [
 
 const EPS = 1e-3;
 const PAN_SENSITIVITY = 0.6;
+const AXIS_GRAB_DISTANCE_PX = 14;
+const AXIS_SCALE_SENSITIVITY = 0.01;
+const MIN_SCALE = 0.5;
+const MAX_SCALE = 5000;
 
 const DRAW_DEBOUNCE_MS = 70;
 let pendingDrawTimeoutId = 0;
@@ -108,7 +120,10 @@ function saveSessionState() {
             v: 1,
             savedAt: Date.now(),
             state: {
-                scale: state.scale,
+                // Keep legacy scale for backward compatibility with old sessions.
+                scale: (state.scaleX + state.scaleY) / 2,
+                scaleX: state.scaleX,
+                scaleY: state.scaleY,
                 offsetX: state.offsetX,
                 offsetY: state.offsetY
             },
@@ -128,13 +143,21 @@ function restoreSessionState() {
 
         const restoredElements = serializeElementsForSession(data.elements);
         const restoredState = data.state && typeof data.state === 'object' ? data.state : null;
+        const restoredScaleX = restoredState ? Number(restoredState.scaleX) : NaN;
+        const restoredScaleY = restoredState ? Number(restoredState.scaleY) : NaN;
         const restoredScale = restoredState ? Number(restoredState.scale) : NaN;
         const restoredOffsetX = restoredState ? Number(restoredState.offsetX) : NaN;
         const restoredOffsetY = restoredState ? Number(restoredState.offsetY) : NaN;
 
         if (Array.isArray(data.elements)) elements = restoredElements;
 
-        if (isFinite(restoredScale)) state.scale = clamp(restoredScale, 0.5, 5000);
+        if (isFinite(restoredScaleX)) state.scaleX = clamp(restoredScaleX, MIN_SCALE, MAX_SCALE);
+        if (isFinite(restoredScaleY)) state.scaleY = clamp(restoredScaleY, MIN_SCALE, MAX_SCALE);
+        if (!isFinite(restoredScaleX) && !isFinite(restoredScaleY) && isFinite(restoredScale)) {
+            const safe = clamp(restoredScale, MIN_SCALE, MAX_SCALE);
+            state.scaleX = safe;
+            state.scaleY = safe;
+        }
         if (isFinite(restoredOffsetX)) state.offsetX = restoredOffsetX;
         if (isFinite(restoredOffsetY)) state.offsetY = restoredOffsetY;
 
@@ -279,6 +302,10 @@ function normalizeInput(raw) {
         .map(line => line.replace(/\/\/.*$/g, '').trim())
         .filter(Boolean);
     return lines.join(' ')
+        .replace(/\\left/gi, '')
+        .replace(/\\right/gi, '')
+        .replace(/\\log/gi, 'log')
+        .replace(/\\ln/gi, 'ln')
         .replace(/π/g, 'pi')
         .replace(/θ/g, 'theta')
         .replace(/≤/g, '<=')
@@ -317,25 +344,355 @@ function expandSum(expr) {
         out = out.slice(0, start) + replacement + out.slice(end + 1);
         match = pattern.exec(out);
     }
+
+    // Also support function-style sigma notation: sum(expr, n, start, end)
+    // Run a few passes so nested sums can be expanded from inside out.
+    let prev = '';
+    let guard = 0;
+    while (out !== prev && guard < 8) {
+        prev = out;
+        out = rewriteFunctionStyleSumOnce(out);
+        guard++;
+    }
+
     return out;
+}
+
+function rewriteFunctionStyleSumOnce(expr) {
+    let out = '';
+    let i = 0;
+    const lowerExpr = expr.toLowerCase();
+
+    while (i < expr.length) {
+        const idx = lowerExpr.indexOf('sum', i);
+        if (idx === -1) {
+            out += expr.slice(i);
+            break;
+        }
+
+        const prev = expr[idx - 1];
+        const next = expr[idx + 3];
+        if (isIdentifierCharacter(prev) || isIdentifierCharacter(next)) {
+            out += expr.slice(i, idx + 3);
+            i = idx + 3;
+            continue;
+        }
+
+        let cursor = idx + 3;
+        while (cursor < expr.length && /\s/.test(expr[cursor])) cursor++;
+        if (expr[cursor] !== '(') {
+            out += expr.slice(i, idx + 3);
+            i = idx + 3;
+            continue;
+        }
+
+        const closeParen = findMatchingDelimiter(expr, cursor, '(', ')');
+        if (closeParen === -1) {
+            out += expr.slice(i);
+            break;
+        }
+
+        out += expr.slice(i, idx);
+
+        const argsText = expr.slice(cursor + 1, closeParen);
+        const args = splitTopLevelArguments(argsText);
+        if (args.length === 4) {
+            const bodyExpr = args[0].trim();
+            const indexVar = args[1].trim();
+            const startExpr = args[2].trim();
+            const endExpr = args[3].trim();
+            const isValidIndex = /^[A-Za-z_][A-Za-z0-9_]*$/.test(indexVar);
+
+            if (bodyExpr && startExpr && endExpr && isValidIndex) {
+                out += `(function(){let __sum=0;for(let ${indexVar}=${startExpr};${indexVar}<=${endExpr};${indexVar}++){__sum+=(${bodyExpr});}return __sum;})()`;
+            } else {
+                out += expr.slice(idx, closeParen + 1);
+            }
+        } else {
+            out += expr.slice(idx, closeParen + 1);
+        }
+
+        i = closeParen + 1;
+    }
+
+    return out;
+}
+
+const IMPLICIT_MUL_FUNCTION_NAMES = new Set([
+    'sin', 'cos', 'tan', 'asin', 'acos', 'atan',
+    'sqrt', 'log', 'log10', 'log2', 'exp', 'abs',
+    'max', 'min', 'floor', 'ceil', 'pow', 'sign',
+    'sum', 'logbase'
+]);
+
+const IMPLICIT_MUL_SYMBOL_NAMES = new Set([
+    'x', 'y', 't', 'n', 'theta', 'pi', 'e', 'eps'
+]);
+
+function tokenizeForImplicitMultiplication(expr) {
+    const tokens = [];
+    let i = 0;
+    while (i < expr.length) {
+        const ch = expr[i];
+
+        if (/\s/.test(ch)) {
+            i++;
+            continue;
+        }
+
+        if (ch === '(') {
+            tokens.push({ type: 'openParen', value: ch });
+            i++;
+            continue;
+        }
+        if (ch === ')') {
+            tokens.push({ type: 'closeParen', value: ch });
+            i++;
+            continue;
+        }
+
+        const numberMatch = /^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/.exec(expr.slice(i));
+        if (numberMatch) {
+            tokens.push({ type: 'number', value: numberMatch[0] });
+            i += numberMatch[0].length;
+            continue;
+        }
+
+        const idMatch = /^[A-Za-z_][A-Za-z0-9_]*/.exec(expr.slice(i));
+        if (idMatch) {
+            tokens.push({ type: 'identifier', value: idMatch[0] });
+            i += idMatch[0].length;
+            continue;
+        }
+
+        tokens.push({ type: 'operator', value: ch });
+        i++;
+    }
+    return tokens;
+}
+
+function shouldInsertImplicitMultiplication(prevToken, nextToken) {
+    const prevCanEndFactor = prevToken.type === 'number'
+        || prevToken.type === 'identifier'
+        || prevToken.type === 'closeParen';
+    const nextCanStartFactor = nextToken.type === 'number'
+        || nextToken.type === 'identifier'
+        || nextToken.type === 'openParen';
+
+    if (!prevCanEndFactor || !nextCanStartFactor) return false;
+
+    if (prevToken.type === 'identifier' && nextToken.type === 'openParen') {
+        const prevName = String(prevToken.value || '').toLowerCase();
+        if (IMPLICIT_MUL_FUNCTION_NAMES.has(prevName)) return false;
+        if (!IMPLICIT_MUL_SYMBOL_NAMES.has(prevName)) return false;
+    }
+
+    return true;
+}
+
+function insertImplicitMultiplication(expr) {
+    const tokens = tokenizeForImplicitMultiplication(expr);
+    if (tokens.length < 2) return expr;
+
+    const out = [tokens[0].value];
+    for (let i = 1; i < tokens.length; i++) {
+        const prev = tokens[i - 1];
+        const curr = tokens[i];
+        if (shouldInsertImplicitMultiplication(prev, curr)) {
+            out.push('*');
+        }
+        out.push(curr.value);
+    }
+    return out.join('');
+}
+
+function isIdentifierCharacter(ch) {
+    return !!ch && /[A-Za-z0-9_]/.test(ch);
+}
+
+function findMatchingDelimiter(text, startIndex, openChar, closeChar) {
+    let depth = 0;
+    for (let i = startIndex; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === openChar) depth++;
+        if (ch === closeChar) {
+            depth--;
+            if (depth === 0) return i;
+        }
+    }
+    return -1;
+}
+
+function splitTopLevelArguments(text) {
+    const args = [];
+    let start = 0;
+    let depthParen = 0;
+    let depthBracket = 0;
+    let depthBrace = 0;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '(') depthParen++;
+        else if (ch === ')') depthParen = Math.max(0, depthParen - 1);
+        else if (ch === '[') depthBracket++;
+        else if (ch === ']') depthBracket = Math.max(0, depthBracket - 1);
+        else if (ch === '{') depthBrace++;
+        else if (ch === '}') depthBrace = Math.max(0, depthBrace - 1);
+        else if (ch === ',' && depthParen === 0 && depthBracket === 0 && depthBrace === 0) {
+            args.push(text.slice(start, i).trim());
+            start = i + 1;
+        }
+    }
+    args.push(text.slice(start).trim());
+    return args.filter((arg) => arg.length > 0);
+}
+
+function rewriteLogSubscriptNotation(expr) {
+    let out = '';
+    let i = 0;
+
+    while (i < expr.length) {
+        const idx = expr.indexOf('log_', i);
+        if (idx === -1) {
+            out += expr.slice(i);
+            break;
+        }
+
+        const prev = expr[idx - 1];
+        if (isIdentifierCharacter(prev)) {
+            out += expr.slice(i, idx + 4);
+            i = idx + 4;
+            continue;
+        }
+
+        out += expr.slice(i, idx);
+        let cursor = idx + 4;
+        while (cursor < expr.length && /\s/.test(expr[cursor])) cursor++;
+
+        let baseExpr = '';
+        if (expr[cursor] === '{') {
+            const closeBase = findMatchingDelimiter(expr, cursor, '{', '}');
+            if (closeBase === -1) {
+                out += expr.slice(idx, cursor + 1);
+                i = cursor + 1;
+                continue;
+            }
+            baseExpr = expr.slice(cursor + 1, closeBase).trim();
+            cursor = closeBase + 1;
+        } else {
+            const token = /^[+-]?\d+(?:\.\d+)?|^[A-Za-z_][A-Za-z0-9_]*/.exec(expr.slice(cursor));
+            if (!token) {
+                out += expr.slice(idx, idx + 4);
+                i = idx + 4;
+                continue;
+            }
+            baseExpr = token[0].trim();
+            cursor += token[0].length;
+        }
+
+        while (cursor < expr.length && /\s/.test(expr[cursor])) cursor++;
+        if (expr[cursor] !== '(' || !baseExpr) {
+            out += expr.slice(idx, cursor);
+            i = cursor;
+            continue;
+        }
+
+        const closeArg = findMatchingDelimiter(expr, cursor, '(', ')');
+        if (closeArg === -1) {
+            out += expr.slice(idx, cursor + 1);
+            i = cursor + 1;
+            continue;
+        }
+
+        const valueExpr = expr.slice(cursor + 1, closeArg).trim();
+        if (!valueExpr) {
+            out += expr.slice(idx, closeArg + 1);
+            i = closeArg + 1;
+            continue;
+        }
+
+        out += `logBase((${baseExpr}),(${valueExpr}))`;
+        i = closeArg + 1;
+    }
+
+    return out;
+}
+
+function rewriteTwoArgumentLogCalls(expr) {
+    let out = '';
+    let i = 0;
+
+    while (i < expr.length) {
+        const idx = expr.indexOf('log', i);
+        if (idx === -1) {
+            out += expr.slice(i);
+            break;
+        }
+
+        const prev = expr[idx - 1];
+        const next = expr[idx + 3];
+        if (isIdentifierCharacter(prev) || isIdentifierCharacter(next)) {
+            out += expr.slice(i, idx + 3);
+            i = idx + 3;
+            continue;
+        }
+
+        let cursor = idx + 3;
+        while (cursor < expr.length && /\s/.test(expr[cursor])) cursor++;
+        if (expr[cursor] !== '(') {
+            out += expr.slice(i, idx + 3);
+            i = idx + 3;
+            continue;
+        }
+
+        const closeParen = findMatchingDelimiter(expr, cursor, '(', ')');
+        if (closeParen === -1) {
+            out += expr.slice(i, idx + 3);
+            i = idx + 3;
+            continue;
+        }
+
+        out += expr.slice(i, idx);
+        const inner = expr.slice(cursor + 1, closeParen);
+        const args = splitTopLevelArguments(inner);
+        if (args.length === 2) {
+            out += `logBase((${args[0]}),(${args[1]}))`;
+        } else {
+            out += `log(${inner})`;
+        }
+        i = closeParen + 1;
+    }
+
+    return out;
+}
+
+function logBaseHelper(base, value) {
+    const b = Number(base);
+    const v = Number(value);
+    if (!isFinite(b) || !isFinite(v)) return NaN;
+    if (b <= 0 || v <= 0) return NaN;
+    if (Math.abs(b - 1) < EPS) return NaN;
+    return Math.log(v) / Math.log(b);
 }
 
 function preprocessExpression(expr) {
     let s = normalizeInput(expr);
-    s = expandSum(s);
     s = s.replace(/\bln\b/gi, 'log');
     s = s.replace(/\bsgn\b/gi, 'sign');
+    s = rewriteLogSubscriptNotation(s);
+    s = rewriteTwoArgumentLogCalls(s);
+    s = insertImplicitMultiplication(s);
+    s = expandSum(s);
     s = s.replace(/\^/g, '**');
     return s;
 }
 
 function createEvaluator(expression, variables) {
     const prepared = preprocessExpression(expression);
-    const fn = new Function(...variables, 'sum', 'pi', 'e', 'eps', `
-        const { sin, cos, tan, asin, acos, atan, sqrt, log, exp, abs, max, min, floor, ceil, pow, sign } = Math;
+    const fn = new Function(...variables, 'sum', 'pi', 'e', 'eps', 'logBase', `
+        const { sin, cos, tan, asin, acos, atan, sqrt, log, log10, log2, exp, abs, max, min, floor, ceil, pow, sign } = Math;
         return ${prepared};
     `);
-    return (vars) => fn(...variables.map((v) => vars[v]), sumHelper, Math.PI, Math.E, EPS);
+    return (vars) => fn(...variables.map((v) => vars[v]), sumHelper, Math.PI, Math.E, EPS, logBaseHelper);
 }
 
 function sumHelper(n, start, end, exprFn) {
@@ -364,7 +721,9 @@ function parseRange(input, varName) {
 }
 
 function parsePiecewise(input) {
-    const match = /\{([\s\S]+)\}/.exec(input);
+    const text = String(input || '').trim();
+    if (!text.startsWith('{') || !text.endsWith('}')) return null;
+    const match = /^\{([\s\S]+)\}$/.exec(text);
     if (!match) return null;
     const body = match[1];
     const parts = body.split(';').map(part => part.trim()).filter(Boolean);
@@ -378,24 +737,89 @@ function parsePiecewise(input) {
     return pieces.length ? pieces : null;
 }
 
+function inferParametricVariable(xExpr, yExpr, hint) {
+    const hinted = String(hint || '').toLowerCase();
+    if (hinted === 'theta' || hinted === 't') return hinted;
+    const body = `${xExpr || ''} ${yExpr || ''}`;
+    const hasTheta = /\btheta\b/i.test(body);
+    const hasT = /\bt\b/i.test(body);
+    if (hasTheta && !hasT) return 'theta';
+    return 't';
+}
+
+function parseParametricTuple(text) {
+    const trimmed = String(text || '').trim();
+    if (!trimmed.startsWith('(')) return null;
+
+    const closeIndex = findMatchingDelimiter(trimmed, 0, '(', ')');
+    if (closeIndex <= 0) return null;
+
+    const tupleBody = trimmed.slice(1, closeIndex);
+    const tupleArgs = splitTopLevelArguments(tupleBody);
+    if (tupleArgs.length !== 2) return null;
+
+    const tail = trimmed.slice(closeIndex + 1).trim();
+    if (tail && !/^[,;]?\s*(?:t|theta)\s*in\s*\[/i.test(tail)) return null;
+
+    const xExpr = tupleArgs[0].trim();
+    const yExpr = tupleArgs[1].trim();
+    if (!xExpr || !yExpr) return null;
+
+    const paramVar = inferParametricVariable(xExpr, yExpr);
+    const range = parseRange(trimmed, paramVar) || parseRange(trimmed, paramVar === 't' ? 'theta' : 't');
+    const tMinExpr = range ? range[0] : '0';
+    const tMaxExpr = range ? range[1] : '2*pi';
+    const tMin = evalLiteral(tMinExpr);
+    const tMax = evalLiteral(tMaxExpr);
+
+    return {
+        type: 'parametric',
+        xExpr,
+        yExpr,
+        paramVar,
+        tMin,
+        tMax
+    };
+}
+
 function parseParametric(input) {
     const text = normalizeInput(input);
+    const tupleParametric = parseParametricTuple(text);
+    if (tupleParametric) return tupleParametric;
+
     const stop = String.raw`(?=,|;|\bx\s*[\(]?(?:t|theta)?\s*[\)]?\s*=|\by\s*[\(]?(?:t|theta)?\s*[\)]?\s*=|\bt\s*in\b|\btheta\s*in\b|$)`;
     // Accept both "x = expr" and "x(t) = expr" / "x(θ) = expr"
-    const xMatch = new RegExp(String.raw`\bx\s*(?:\(\s*(?:t|theta)\s*\))?\s*=\s*(.+?)${stop}`, 'i').exec(text);
-    const yMatch = new RegExp(String.raw`\by\s*(?:\(\s*(?:t|theta)\s*\))?\s*=\s*(.+?)${stop}`, 'i').exec(text);
+    const xMatch = new RegExp(String.raw`\bx\s*(?:\(\s*(t|theta)\s*\))?\s*=\s*(.+?)${stop}`, 'i').exec(text);
+    const yMatch = new RegExp(String.raw`\by\s*(?:\(\s*(t|theta)\s*\))?\s*=\s*(.+?)${stop}`, 'i').exec(text);
     if (!xMatch || !yMatch) return null;
-    const range = parseRange(text, 't') || parseRange(text, 'theta');
+    const xExpr = xMatch[2].trim();
+    const yExpr = yMatch[2].trim();
+    const paramVar = inferParametricVariable(xExpr, yExpr, xMatch[1] || yMatch[1]);
+    const range = parseRange(text, paramVar) || parseRange(text, paramVar === 't' ? 'theta' : 't');
     const tMinExpr = range ? range[0] : '-10';
     const tMaxExpr = range ? range[1] : '10';
     const tMin = evalLiteral(tMinExpr);
     const tMax = evalLiteral(tMaxExpr);
     return {
         type: 'parametric',
-        xExpr: xMatch[1].trim(),
-        yExpr: yMatch[1].trim(),
+        xExpr,
+        yExpr,
+        paramVar,
         tMin,
         tMax
+    };
+}
+
+function compileParametricDefinition(definition) {
+    const paramVar = String(definition?.paramVar || 't').toLowerCase() === 'theta' ? 'theta' : 't';
+    const xEvaluator = createEvaluator(definition.xExpr, [paramVar]);
+    const yEvaluator = createEvaluator(definition.yExpr, [paramVar]);
+    return {
+        type: 'parametric',
+        xFn: ({ t }) => xEvaluator({ [paramVar]: t }),
+        yFn: ({ t }) => yEvaluator({ [paramVar]: t }),
+        tMin: definition.tMin,
+        tMax: definition.tMax
     };
 }
 
@@ -469,11 +893,23 @@ function parseConic(input) {
     return null;
 }
 
+function findStandaloneEquals(text) {
+    for (let i = 0; i < text.length; i++) {
+        if (text[i] !== '=') continue;
+        const prev = text[i - 1] || '';
+        const next = text[i + 1] || '';
+        if (prev === '<' || prev === '>' || prev === '=' || prev === '!') continue;
+        if (next === '=' || next === '>') continue;
+        return i;
+    }
+    return -1;
+}
+
 function parseImplicit(input) {
     const text = normalizeInput(input);
     if (/^\s*r\s*=/.test(text)) return null;
-    if (!text.includes('=')) return null;
-    const eqIndex = text.indexOf('=');
+    const eqIndex = findStandaloneEquals(text);
+    if (eqIndex === -1) return null;
     const left = text.slice(0, eqIndex).trim();
     const right = text.slice(eqIndex + 1).trim();
     if (!left || !right) return null;
@@ -481,6 +917,9 @@ function parseImplicit(input) {
     // If both sides are free of x and y, this is not a planar equation
     const hasXY = (s) => /\bx\b/i.test(s) || /\by\b/i.test(s);
     if (!hasXY(left) && !hasXY(right)) return null;
+
+    const isLeftFunctionOfX = /^\s*[a-z_][a-z0-9_]*\s*\(\s*x\s*\)\s*$/i.test(left);
+    if (isLeftFunctionOfX) return null;
 
     const isLeftJustY = /^y$/i.test(left.replace(/\s+/g, ''));
     if (isLeftJustY && !/\by\b/i.test(right)) return null;
@@ -543,22 +982,84 @@ function parseSegments(input) {
     return segments.length ? { type: 'segments', segments } : null;
 }
 
+function parseAuxiliaryAsymptote(input) {
+    const text = normalizeInput(input);
+    const prefix = /^(?:as[ií]ntota|asymptote|aux(?:iliar)?)\s*:?\s*/i;
+    if (!prefix.test(text)) return null;
+
+    const body = text
+        .replace(prefix, '')
+        .replace(/^(?:vertical|horizontal|oblicua|oblique)\s*:?\s*/i, '')
+        .trim();
+    if (!body) return { type: 'invalid' };
+
+    const verticalMatch = /^x\s*=\s*(.+)$/i.exec(body);
+    if (verticalMatch) {
+        const x = evalLiteral(verticalMatch[1].trim());
+        return isFinite(x)
+            ? { type: 'aux-asymptote', kind: 'vertical', x }
+            : { type: 'invalid' };
+    }
+
+    const yMatch = /^y\s*=\s*(.+)$/i.exec(body);
+    if (yMatch) {
+        const expr = yMatch[1].trim();
+        if (!expr) return { type: 'invalid' };
+
+        if (!/\bx\b/i.test(expr)) {
+            const y = evalLiteral(expr);
+            if (isFinite(y)) return { type: 'aux-asymptote', kind: 'horizontal', y };
+        }
+
+        try {
+            const fn = createEvaluator(expr, ['x']);
+            return { type: 'aux-asymptote', kind: 'line', fn };
+        } catch {
+            return { type: 'invalid' };
+        }
+    }
+
+    return { type: 'invalid' };
+}
+
+function parseAttractor(text) {
+    // Pattern 1: clifford(a, b, c, d)
+    const cliffordMatch = /^\s*clifford\s*\(\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*,\s*([^,)]+)\s*\)\s*$/i.exec(text);
+    if (cliffordMatch) {
+        const a = cliffordMatch[1].trim();
+        const b = cliffordMatch[2].trim();
+        const c = cliffordMatch[3].trim();
+        const d = cliffordMatch[4].trim();
+        return {
+            xNextExpr: `sin((${a})*y)+(${c})*cos((${a})*x)`,
+            yNextExpr: `sin((${b})*x)+(${d})*cos((${b})*y)`
+        };
+    }
+    // Pattern 2: x_new=expr, y_new=expr  or  x_{n+1}=expr, y_{n+1}=expr
+    const newMatch = /^\s*x(?:_new|_\{?n\+1\}?)\s*=\s*(.+?)\s*,\s*y(?:_new|_\{?n\+1\}?)\s*=\s*(.+?)\s*$/i.exec(text);
+    if (newMatch) {
+        return {
+            xNextExpr: newMatch[1].trim(),
+            yNextExpr: newMatch[2].trim()
+        };
+    }
+    return null;
+}
+
 function compileExpression(input) {
     const text = normalizeInput(input);
     if (!text) return { type: 'invalid' };
+
+    const auxiliaryAsymptote = parseAuxiliaryAsymptote(text);
+    if (auxiliaryAsymptote) return auxiliaryAsymptote;
+
     const region = parseRegion(text);
     if (region) return region;
     const segments = parseSegments(text);
     if (segments) {
         return {
             type: 'segments',
-            segments: segments.segments.map(segment => ({
-                type: 'parametric',
-                xFn: createEvaluator(segment.xExpr, ['t']),
-                yFn: createEvaluator(segment.yExpr, ['t']),
-                tMin: segment.tMin,
-                tMax: segment.tMax
-            }))
+            segments: segments.segments.map(segment => compileParametricDefinition(segment))
         };
     }
     const polar = parsePolar(text);
@@ -572,28 +1073,28 @@ function compileExpression(input) {
     }
     const parametric = parseParametric(text);
     if (parametric) {
-        return {
-            type: 'parametric',
-            xFn: createEvaluator(parametric.xExpr, ['t']),
-            yFn: createEvaluator(parametric.yExpr, ['t']),
-            tMin: parametric.tMin,
-            tMax: parametric.tMax
-        };
+        return compileParametricDefinition(parametric);
     }
 
     const conic = parseConic(text);
     if (conic) {
         return {
             type: 'segments',
-            segments: conic.segments.map(segment => ({
-                type: 'parametric',
-                xFn: createEvaluator(segment.xExpr, ['t']),
-                yFn: createEvaluator(segment.yExpr, ['t']),
-                tMin: segment.tMin,
-                tMax: segment.tMax
-            }))
+            segments: conic.segments.map(segment => compileParametricDefinition(segment))
         };
     }
+    const attractor = parseAttractor(text);
+    if (attractor) {
+        return {
+            type: 'attractor',
+            xNextFn: createEvaluator(attractor.xNextExpr, ['x', 'y']),
+            yNextFn: createEvaluator(attractor.yNextExpr, ['x', 'y']),
+            x0: 0.1,
+            y0: 0.1,
+            iterations: 200000
+        };
+    }
+
     const implicit = parseImplicit(text);
     if (implicit) {
         return {
@@ -602,7 +1103,10 @@ function compileExpression(input) {
         };
     }
 
-    let expr = text.replace(/^\s*y\s*=\s*/i, '').trim();
+    let expr = text
+        .replace(/^\s*y\s*=\s*/i, '')
+        .replace(/^\s*[a-z_][a-z0-9_]*\s*\(\s*x\s*\)\s*=\s*/i, '')
+        .trim();
     const piecewise = parsePiecewise(expr);
     if (piecewise) {
         const compiled = piecewise.map(piece => ({
@@ -654,12 +1158,20 @@ function init() {
 const SHOW_AXIS_COORDS_KEY = 'graficador.showAxisCoords.v1';
 const SHOW_REF_COORDS_KEY = 'graficador.showRefCoords.v1';
 const SHOW_REF_POINTS_KEY = 'graficador.showRefPoints.v1';
+const SHOW_AUTO_ASYMPTOTES_KEY = 'graficador.showAutoAsymptotes.v1';
 let showAxisCoords = false;
 let showRefCoords = false;
 let showRefPoints = false;
+let showAutoAsymptotes = true;
 
-function loadBoolKey(key) {
-    try { return sessionStorage.getItem(key) === 'true'; } catch { return false; }
+function loadBoolKey(key, defaultValue = false) {
+    try {
+        const value = sessionStorage.getItem(key);
+        if (value === null) return !!defaultValue;
+        return value === 'true';
+    } catch {
+        return !!defaultValue;
+    }
 }
 function saveBoolKey(key, val) {
     try { sessionStorage.setItem(key, val ? 'true' : 'false'); } catch {}
@@ -680,6 +1192,11 @@ window.onShowRefPointsChange = (checked) => {
     saveBoolKey(SHOW_REF_POINTS_KEY, showRefPoints);
     scheduleDrawFrame();
 };
+window.onShowAutoAsymptotesChange = (checked) => {
+    showAutoAsymptotes = !!checked;
+    saveBoolKey(SHOW_AUTO_ASYMPTOTES_KEY, showAutoAsymptotes);
+    scheduleDrawFrame();
+};
 
 function initThemeSettings() {
     const inputs = Array.from(document.querySelectorAll('input[name="theme-preference"]'));
@@ -698,15 +1215,18 @@ function initThemeSettings() {
         });
     }
 
-    showAxisCoords = loadBoolKey(SHOW_AXIS_COORDS_KEY);
-    showRefCoords = loadBoolKey(SHOW_REF_COORDS_KEY);
-    showRefPoints = loadBoolKey(SHOW_REF_POINTS_KEY);
+    showAxisCoords = loadBoolKey(SHOW_AXIS_COORDS_KEY, false);
+    showRefCoords = loadBoolKey(SHOW_REF_COORDS_KEY, false);
+    showRefPoints = loadBoolKey(SHOW_REF_POINTS_KEY, false);
+    showAutoAsymptotes = loadBoolKey(SHOW_AUTO_ASYMPTOTES_KEY, true);
     const axisCheckbox = document.getElementById('show-axis-coords');
     if (axisCheckbox) axisCheckbox.checked = showAxisCoords;
     const refCheckbox = document.getElementById('show-ref-coords');
     if (refCheckbox) refCheckbox.checked = showRefCoords;
     const refPointsCheckbox = document.getElementById('show-ref-points');
     if (refPointsCheckbox) refPointsCheckbox.checked = showRefPoints;
+    const asymptotesCheckbox = document.getElementById('show-auto-asymptotes');
+    if (asymptotesCheckbox) asymptotesCheckbox.checked = showAutoAsymptotes;
 }
 
 function resizeCanvas(shouldDraw = true) {
@@ -722,11 +1242,13 @@ function resizeCanvas(shouldDraw = true) {
 }
 
 window.resetView = () => {
-    state.scale = 40;
+    state.scaleX = 40;
+    state.scaleY = 40;
     state.offsetX = canvas.width / 2;
     state.offsetY = canvas.height / 2;
     draw();
     scheduleSessionSave();
+    setAxisResetButtonVisible(false);
 };
 
 window.confirmClear = () => {
@@ -745,6 +1267,38 @@ window.executeClear = () => {
 window.openModal = (id) => document.getElementById(id).classList.remove('hidden');
 window.closeModal = (id) => document.getElementById(id).classList.add('hidden');
 
+function setAxisResetButtonVisible(isVisible) {
+    if (!axisResetButton) return;
+    axisResetButton.classList.toggle('hidden', !isVisible);
+    axisResetButton.setAttribute('aria-hidden', isVisible ? 'false' : 'true');
+}
+
+function getAxisGrabMode(mx, my) {
+    const yAxisScreenX = worldToScreenX(0);
+    const xAxisScreenY = worldToScreenY(0);
+    const yAxisVisible = yAxisScreenX >= -AXIS_GRAB_DISTANCE_PX && yAxisScreenX <= canvas.width + AXIS_GRAB_DISTANCE_PX;
+    const xAxisVisible = xAxisScreenY >= -AXIS_GRAB_DISTANCE_PX && xAxisScreenY <= canvas.height + AXIS_GRAB_DISTANCE_PX;
+
+    const nearYAxis = yAxisVisible && Math.abs(mx - yAxisScreenX) <= AXIS_GRAB_DISTANCE_PX;
+    const nearXAxis = xAxisVisible && Math.abs(my - xAxisScreenY) <= AXIS_GRAB_DISTANCE_PX;
+
+    if (!nearXAxis && !nearYAxis) return null;
+    if (nearXAxis && nearYAxis) {
+        return Math.abs(my - xAxisScreenY) <= Math.abs(mx - yAxisScreenX) ? 'x-axis' : 'y-axis';
+    }
+    return nearXAxis ? 'x-axis' : 'y-axis';
+}
+
+function startAxisScalingInteraction(mode, clientX, clientY) {
+    state.isAxisScaling = true;
+    state.axisScaleMode = mode;
+    state.axisScaleStartX = state.scaleX;
+    state.axisScaleStartY = state.scaleY;
+    state.axisScalePointerStart = mode === 'x-axis' ? clientX : clientY;
+    state.axisScaleMoved = false;
+    canvas.style.cursor = mode === 'x-axis' ? 'ew-resize' : 'ns-resize';
+}
+
 window.addElement = (type) => {
     closeModal('type-selector-modal');
     const nextColor = getNextDistinctColor();
@@ -752,7 +1306,7 @@ window.addElement = (type) => {
         elements.push({ id: Date.now(), type: 'function', content: '', color: nextColor, visible: true });
     } else {
         const centerX = screenToWorldX(canvas.width / 2);
-        const centerY = (state.offsetY - (canvas.height / 2)) / state.scale;
+        const centerY = screenToWorldY(canvas.height / 2);
         elements.push({ id: Date.now(), type: 'text', content: 'Etiqueta', x: centerX, y: centerY, color: nextColor, visible: true });
     }
     renderElementsList();
@@ -777,8 +1331,13 @@ function handleMouseDown(e) {
         state.draggingElementId = clickedText.id;
         canvas.style.cursor = 'move';
     } else {
-        state.isDraggingCanvas = true;
-        canvas.style.cursor = 'grabbing';
+        const axisMode = getAxisGrabMode(mx, my);
+        if (axisMode) {
+            startAxisScalingInteraction(axisMode, e.clientX, e.clientY);
+        } else {
+            state.isDraggingCanvas = true;
+            canvas.style.cursor = 'grabbing';
+        }
     }
     state.lastMouseX = e.clientX;
     state.lastMouseY = e.clientY;
@@ -790,13 +1349,38 @@ function handleMouseMove(e) {
     const my = e.clientY - rect.top;
 
     document.getElementById('coord-x').textContent = screenToWorldX(mx).toFixed(2);
-    document.getElementById('coord-y').textContent = ((state.offsetY - my) / state.scale).toFixed(2);
+    document.getElementById('coord-y').textContent = screenToWorldY(my).toFixed(2);
+
+    if (state.isAxisScaling && state.axisScaleMode) {
+        const pointer = state.axisScaleMode === 'x-axis' ? e.clientX : e.clientY;
+        const delta = state.axisScaleMode === 'x-axis'
+            ? (pointer - state.axisScalePointerStart)
+            : (state.axisScalePointerStart - pointer);
+        const nextScale = clamp(
+            (state.axisScaleMode === 'x-axis' ? state.axisScaleStartX : state.axisScaleStartY)
+            * Math.exp(delta * AXIS_SCALE_SENSITIVITY),
+            MIN_SCALE,
+            MAX_SCALE
+        );
+        if (state.axisScaleMode === 'x-axis') {
+            if (Math.abs(nextScale - state.scaleX) > 1e-9) {
+                state.scaleX = nextScale;
+                state.axisScaleMoved = true;
+                scheduleDrawFrame();
+            }
+        } else if (Math.abs(nextScale - state.scaleY) > 1e-9) {
+            state.scaleY = nextScale;
+            state.axisScaleMoved = true;
+            scheduleDrawFrame();
+        }
+        return;
+    }
 
     if (state.draggingElementId !== null) {
         const elIndex = elements.findIndex(e => e.id === state.draggingElementId);
         if (elIndex !== -1) {
             elements[elIndex].x = screenToWorldX(mx);
-            elements[elIndex].y = (state.offsetY - my) / state.scale;
+            elements[elIndex].y = screenToWorldY(my);
             scheduleDrawFrame();
         }
         return;
@@ -810,15 +1394,33 @@ function handleMouseMove(e) {
         state.offsetX += dx;
         state.offsetY += dy;
         scheduleDrawFrame();
+    } else {
+        const axisMode = getAxisGrabMode(mx, my);
+        if (axisMode === 'x-axis') canvas.style.cursor = 'ew-resize';
+        else if (axisMode === 'y-axis') canvas.style.cursor = 'ns-resize';
+        else canvas.style.cursor = 'crosshair';
     }
     state.lastMouseX = e.clientX;
     state.lastMouseY = e.clientY;
 }
 
 function handleMouseUp() {
+    const usedAxisScale = state.isAxisScaling && state.axisScaleMoved;
+
+    state.isAxisScaling = false;
+    state.axisScaleMode = null;
+    state.axisScalePointerStart = 0;
+    state.axisScaleStartX = state.scaleX;
+    state.axisScaleStartY = state.scaleY;
+    state.axisScaleMoved = false;
     state.isDraggingCanvas = false;
     state.draggingElementId = null;
     canvas.style.cursor = 'crosshair';
+
+    if (usedAxisScale) {
+        setAxisResetButtonVisible(true);
+    }
+
     scheduleSessionSave();
 }
 
@@ -839,14 +1441,13 @@ function handleZoom(e) {
     const mouseX = e.clientX - rect.left;
     const mouseY = e.clientY - rect.top;
     const worldX = screenToWorldX(mouseX);
-    const worldY = (state.offsetY - mouseY) / state.scale;
+    const worldY = screenToWorldY(mouseY);
+    const zoomFactor = e.deltaY < 0 ? (1 + zoomIntensity) : (1 - zoomIntensity);
 
-    if (e.deltaY < 0) state.scale *= (1 + zoomIntensity);
-    else state.scale *= (1 - zoomIntensity);
-
-    state.scale = Math.max(0.5, Math.min(state.scale, 5000));
-    state.offsetX = mouseX - (worldX * state.scale);
-    state.offsetY = mouseY + (worldY * state.scale);
+    state.scaleX = clamp(state.scaleX * zoomFactor, MIN_SCALE, MAX_SCALE);
+    state.scaleY = clamp(state.scaleY * zoomFactor, MIN_SCALE, MAX_SCALE);
+    state.offsetX = mouseX - (worldX * state.scaleX);
+    state.offsetY = mouseY + (worldY * state.scaleY);
     scheduleDrawFrame();
     scheduleSessionSave();
 }
@@ -880,8 +1481,9 @@ function ensureImplicitCanvas() {
 
 function createImplicitJob(compiled, color) {
     const fn = compiled.fn;
-    const stepPx = state.scale < 20 ? 2 : state.scale < 50 ? 3 : 4;
-    const stepWorld = stepPx / state.scale;
+    const effectiveScale = Math.max(Math.min(state.scaleX, state.scaleY), MIN_SCALE);
+    const stepPx = effectiveScale < 20 ? 2 : effectiveScale < 50 ? 3 : 4;
+    const stepWorld = stepPx / effectiveScale;
     const minX = screenToWorldX(0);
     const maxX = screenToWorldX(canvas.width);
     const minY = screenToWorldY(canvas.height);
@@ -985,9 +1587,10 @@ function draw() {
     const palette = getThemePalette();
     ctx.fillStyle = palette.bg;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    const step = calculateStep(state.scale);
-    drawGrid(step);
-    drawAxes(step);
+    const stepX = calculateStep(state.scaleX);
+    const stepY = calculateStep(state.scaleY);
+    drawGrid(stepX, stepY);
+    drawAxes(stepX, stepY);
 
     const implicitQueue = [];
     elements.filter(e => e.type === 'function' && e.visible).forEach((el) => drawGraphElement(el, implicitQueue));
@@ -1037,7 +1640,12 @@ function drawGraphElement(el, implicitQueue) {
     if (!el.content.trim()) return;
     const compiled = getCompiledElement(el);
     if (!compiled || compiled.type === 'invalid') return;
-    if (compiled.type === 'function') return drawCartesianFunction(compiled, el.color);
+    if (compiled.type === 'function') {
+        drawCartesianFunction(compiled, el.color);
+        drawFunctionAutoAsymptotes(compiled);
+        return;
+    }
+    if (compiled.type === 'aux-asymptote') return drawAuxiliaryAsymptote(compiled);
     if (compiled.type === 'parametric') return drawParametric(compiled, el.color);
     if (compiled.type === 'polar') return drawPolar(compiled, el.color);
     if (compiled.type === 'implicit') {
@@ -1046,29 +1654,560 @@ function drawGraphElement(el, implicitQueue) {
     }
     if (compiled.type === 'segments') return compiled.segments.forEach(segment => drawParametric(segment, el.color));
     if (compiled.type === 'region') return drawRegion(compiled, el.color);
+    if (compiled.type === 'attractor') return drawAttractor(compiled, el.color);
 }
 
 function drawCartesianFunction(compiled, color) {
     const fn = compiled.fn;
+    const minX = screenToWorldX(0);
+    const maxX = screenToWorldX(canvas.width);
+    if (!isFinite(minX) || !isFinite(maxX) || maxX <= minX) return;
+
+    const baseStepPx = 3;
+    const baseIntervals = Math.max(220, Math.floor(canvas.width / baseStepPx));
+    const worldStep = (maxX - minX) / baseIntervals;
+    const maxDepth = 8;
+    const minWorldStep = Math.max(worldStep / Math.pow(2, maxDepth), (maxX - minX) / Math.max(canvas.width * 20, 2200));
+    const jumpDeltaPx = Math.max(canvas.height * 0.55, 55);
+
     ctx.beginPath();
     ctx.lineWidth = 2;
     ctx.strokeStyle = color;
-    let isDrawing = false;
-    let lastScreenY = null;
-    for (let px = 0; px < canvas.width; px += 2) {
-        const worldX = screenToWorldX(px);
-        let worldY = NaN;
-        try { worldY = fn(worldX); } catch { worldY = NaN; }
-        if (!isFinite(worldY)) { isDrawing = false; lastScreenY = null; continue; }
-        const screenY = worldToScreenY(worldY);
-        if (lastScreenY !== null && Math.abs(screenY - lastScreenY) > canvas.height) {
-            isDrawing = false; ctx.stroke(); ctx.beginPath();
+
+    let hasStroke = false;
+    let penDown = false;
+    let lastSx = 0;
+    let lastSy = 0;
+
+    const ensureMoveTo = (sx, sy) => {
+        if (!penDown) {
+            ctx.moveTo(sx, sy);
+            penDown = true;
+            lastSx = sx;
+            lastSy = sy;
+            return;
         }
-        if (!isDrawing) { ctx.moveTo(px, screenY); isDrawing = true; }
-        else { ctx.lineTo(px, screenY); }
-        lastScreenY = screenY;
+        if (Math.abs(lastSx - sx) > 2 || Math.abs(lastSy - sy) > 2) {
+            ctx.moveTo(sx, sy);
+            lastSx = sx;
+            lastSy = sy;
+        }
+    };
+
+    const drawLineTo = (sx, sy) => {
+        ctx.lineTo(sx, sy);
+        hasStroke = true;
+        lastSx = sx;
+        lastSy = sy;
+    };
+
+    const evaluateY = (x) => evaluateCartesianFunction(fn, x);
+
+    const traceInterval = (x0, y0, x1, y1, depth) => {
+        const interval = x1 - x0;
+        if (!(interval > 0)) return;
+
+        const y0Finite = isFinite(y0);
+        const y1Finite = isFinite(y1);
+        if (!y0Finite || !y1Finite) {
+            if (depth >= maxDepth || interval <= minWorldStep) {
+                penDown = false;
+                return;
+            }
+            const xm = (x0 + x1) / 2;
+            const ym = evaluateY(xm);
+            traceInterval(x0, y0, xm, ym, depth + 1);
+            traceInterval(xm, ym, x1, y1, depth + 1);
+            return;
+        }
+
+        const sx0 = worldToScreenX(x0);
+        const sx1 = worldToScreenX(x1);
+        const sy0 = worldToScreenY(y0);
+        const sy1 = worldToScreenY(y1);
+        const endDeltaPx = Math.abs(sy1 - sy0);
+
+        const xm = (x0 + x1) / 2;
+        const ym = evaluateY(xm);
+        const ymFinite = isFinite(ym);
+        const sym = ymFinite ? worldToScreenY(ym) : NaN;
+        const linearMid = (sy0 + sy1) / 2;
+        const midDeviationPx = ymFinite ? Math.abs(sym - linearMid) : Infinity;
+
+        let likelyDiscontinuity = !ymFinite || midDeviationPx > Math.max(12, endDeltaPx * 0.45);
+        if (!likelyDiscontinuity && endDeltaPx > jumpDeltaPx) {
+            likelyDiscontinuity = true;
+        }
+
+        if (!likelyDiscontinuity) {
+            const q1x = (x0 + xm) / 2;
+            const q3x = (xm + x1) / 2;
+            const yq1 = evaluateY(q1x);
+            const yq3 = evaluateY(q3x);
+            if (!isFinite(yq1) || !isFinite(yq3)) {
+                likelyDiscontinuity = true;
+            } else {
+                const sq1 = worldToScreenY(yq1);
+                const sq3 = worldToScreenY(yq3);
+                const envelopeMin = Math.min(sy0, sy1, sym) - 14;
+                const envelopeMax = Math.max(sy0, sy1, sym) + 14;
+                if (sq1 < envelopeMin || sq1 > envelopeMax || sq3 < envelopeMin || sq3 > envelopeMax) {
+                    likelyDiscontinuity = true;
+                }
+            }
+        }
+
+        if (likelyDiscontinuity && depth < maxDepth && interval > minWorldStep) {
+            const ymSplit = ymFinite ? ym : evaluateY(xm);
+            traceInterval(x0, y0, xm, ymSplit, depth + 1);
+            traceInterval(xm, ymSplit, x1, y1, depth + 1);
+            return;
+        }
+
+        if (likelyDiscontinuity) {
+            penDown = false;
+            return;
+        }
+
+        ensureMoveTo(sx0, sy0);
+        drawLineTo(sx1, sy1);
+    };
+
+    let x0 = minX;
+    let y0 = evaluateY(x0);
+    for (let i = 1; i <= baseIntervals; i++) {
+        const x1 = (i === baseIntervals) ? maxX : (minX + (i * worldStep));
+        const y1 = evaluateY(x1);
+        traceInterval(x0, y0, x1, y1, 0);
+        x0 = x1;
+        y0 = y1;
     }
-    ctx.stroke();
+
+    if (hasStroke) ctx.stroke();
+}
+
+function evaluateCartesianFunction(fn, x) {
+    try {
+        const y = fn(x);
+        return isFinite(y) ? y : NaN;
+    } catch {
+        return NaN;
+    }
+}
+
+function refineVerticalAsymptoteCandidate(fn, left, right) {
+    const a = Math.min(left, right);
+    const b = Math.max(left, right);
+    if (!isFinite(a) || !isFinite(b) || b <= a) return null;
+
+    let bestX = (a + b) / 2;
+    let bestScore = -Infinity;
+    const samples = 24;
+
+    for (let i = 0; i <= samples; i++) {
+        const x = a + ((b - a) * i) / samples;
+        const y = evaluateCartesianFunction(fn, x);
+        if (!isFinite(y)) return x;
+        const score = Math.abs(y);
+        if (score > bestScore) {
+            bestScore = score;
+            bestX = x;
+        }
+    }
+
+    return bestX;
+}
+
+function findVerticalAsymptotes(fn, minX, maxX) {
+    const span = maxX - minX;
+    if (!isFinite(span) || span <= 0) return [];
+
+    const sampleCount = Math.max(300, Math.min(1500, Math.floor(canvas.width * 1.6)));
+    const step = span / sampleCount;
+    const largeWorldY = Math.max((canvas.height / state.scaleY) * 1.5, 10);
+    const candidates = [];
+    const suppressionDistance = Math.max(step * 8, 6 / state.scaleX, 1e-4);
+
+    let prevX = minX;
+    let prevY = evaluateCartesianFunction(fn, prevX);
+
+    for (let i = 1; i <= sampleCount; i++) {
+        const x = minX + i * step;
+        const y = evaluateCartesianFunction(fn, x);
+
+        const prevFinite = isFinite(prevY);
+        const currFinite = isFinite(y);
+        let discontinuity = false;
+
+        if (prevFinite !== currFinite) {
+            discontinuity = true;
+        } else if (prevFinite && currFinite) {
+            const jump = Math.abs(y - prevY);
+            if (jump > largeWorldY * 6 && Math.abs(prevY) > largeWorldY * 0.5 && Math.abs(y) > largeWorldY * 0.5) {
+                discontinuity = true;
+            }
+            if (prevY * y < 0 && Math.abs(prevY) > largeWorldY * 1.3 && Math.abs(y) > largeWorldY * 1.3) {
+                discontinuity = true;
+            }
+        }
+
+        if (discontinuity) {
+            const candidate = refineVerticalAsymptoteCandidate(fn, prevX, x);
+            if (isFinite(candidate)) {
+                const last = candidates[candidates.length - 1];
+                if (!isFinite(last) || Math.abs(candidate - last) > suppressionDistance) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+
+        prevX = x;
+        prevY = y;
+    }
+
+    const clusterDistance = Math.max(step * 18, 12 / state.scaleX, 1e-3);
+    const verifyDelta = Math.max(step * 0.9, span * 0.001);
+    const unique = [];
+    const clusteredCandidates = [];
+
+    const sorted = candidates
+        .filter((candidateX) => isFinite(candidateX) && candidateX > minX && candidateX < maxX)
+        .sort((a, b) => a - b);
+
+    let cluster = [];
+    const flushCluster = () => {
+        if (!cluster.length) return;
+        const mid = cluster[Math.floor(cluster.length / 2)];
+        if (isFinite(mid)) clusteredCandidates.push(mid);
+        cluster = [];
+    };
+
+    for (const candidateX of sorted) {
+        if (!cluster.length) {
+            cluster.push(candidateX);
+            continue;
+        }
+        const lastInCluster = cluster[cluster.length - 1];
+        if (Math.abs(candidateX - lastInCluster) <= clusterDistance) {
+            cluster.push(candidateX);
+        } else {
+            flushCluster();
+            cluster.push(candidateX);
+        }
+    }
+    flushCluster();
+
+    clusteredCandidates.forEach((candidateX) => {
+        if (unique.some((x) => Math.abs(x - candidateX) < clusterDistance * 0.75)) return;
+
+        const yLeft = evaluateCartesianFunction(fn, candidateX - verifyDelta);
+        const yRight = evaluateCartesianFunction(fn, candidateX + verifyDelta);
+        const yCenter = evaluateCartesianFunction(fn, candidateX);
+
+        const holeLike = isFinite(yLeft)
+            && isFinite(yRight)
+            && Math.abs(yLeft) < largeWorldY * 0.8
+            && Math.abs(yRight) < largeWorldY * 0.8
+            && Math.abs(yLeft - yRight) < largeWorldY * 0.4;
+
+        if (holeLike) return;
+
+        const divergesNear = !isFinite(yCenter)
+            || !isFinite(yLeft)
+            || !isFinite(yRight)
+            || (isFinite(yLeft) && Math.abs(yLeft) > largeWorldY)
+            || (isFinite(yRight) && Math.abs(yRight) > largeWorldY)
+            || (isFinite(yLeft) && isFinite(yRight) && Math.abs(yLeft - yRight) > largeWorldY * 8);
+
+        if (divergesNear) unique.push(candidateX);
+    });
+
+    return unique;
+}
+
+function estimateEndLinearAsymptote(fn, minX, maxX, direction) {
+    const span = Math.max(4, Math.abs(maxX - minX));
+    const anchor = direction > 0 ? maxX : minX;
+    const d1 = Math.max(span * 2, 12);
+    const d2 = Math.max(span * 4, 24);
+    const d3 = Math.max(span * 8, 48);
+    const d4 = Math.max(span * 14, 84);
+    const d5 = Math.max(span * 22, 132);
+
+    const x1 = anchor + direction * d1;
+    const x2 = anchor + direction * d2;
+    const x3 = anchor + direction * d3;
+    const x4 = anchor + direction * d4;
+    const x5 = anchor + direction * d5;
+
+    const y1 = evaluateCartesianFunction(fn, x1);
+    const y2 = evaluateCartesianFunction(fn, x2);
+    const y3 = evaluateCartesianFunction(fn, x3);
+    const y4 = evaluateCartesianFunction(fn, x4);
+    const y5 = evaluateCartesianFunction(fn, x5);
+    if (![y1, y2, y3, y4, y5].every(isFinite)) return null;
+
+    const m12 = (y2 - y1) / (x2 - x1);
+    const m23 = (y3 - y2) / (x3 - x2);
+    const m34 = (y4 - y3) / (x4 - x3);
+    if (![m12, m23, m34].every(isFinite)) return null;
+
+    const slopeSpread = Math.max(m12, m23, m34) - Math.min(m12, m23, m34);
+    const slopeMagnitude = Math.max(Math.abs(m12), Math.abs(m23), Math.abs(m34));
+    if (slopeSpread > Math.max(0.08, slopeMagnitude * 0.7)) return null;
+
+    const m = (m23 + m34 + ((y4 - y2) / (x4 - x2))) / 3;
+    const b2 = y2 - (m * x2);
+    const b3 = y3 - (m * x3);
+    const b4 = y4 - (m * x4);
+    const bValues = [b2, b3, b4];
+    const bSpread = Math.max(...bValues) - Math.min(...bValues);
+    const bAvg = (b2 + b3 + b4) / 3;
+    if (bSpread > Math.max(2.5, Math.abs(bAvg) * 0.35)) return null;
+
+    const pred5 = (m * x5) + bAvg;
+    const err5 = Math.abs(y5 - pred5);
+    const scale5 = Math.max(1, Math.abs(y5), Math.abs(pred5));
+    if (err5 > Math.max(0.35, scale5 * 0.15)) return null;
+
+    const nearX = direction > 0 ? (maxX - span * 0.25) : (minX + span * 0.25);
+    const nearY = evaluateCartesianFunction(fn, nearX);
+    if (isFinite(nearY)) {
+        const nearErr = Math.abs(nearY - ((m * nearX) + bAvg));
+        const farErr = Math.abs(y4 - ((m * x4) + bAvg));
+        if (!(farErr < nearErr * 0.9 || nearErr > 0.35)) return null;
+    }
+
+    if (Math.abs(m) < 0.03) {
+        const horizontalY = (y3 + y4 + y5) / 3;
+        return { type: 'horizontal', y: horizontalY };
+    }
+
+    return { type: 'oblique', m, b: bAvg };
+}
+
+function detectLinearAsymptotes(fn, minX, maxX) {
+    const sideModels = [
+        estimateEndLinearAsymptote(fn, minX, maxX, -1),
+        estimateEndLinearAsymptote(fn, minX, maxX, 1)
+    ].filter(Boolean);
+
+    const horizontalYs = [];
+    const obliqueLines = [];
+    sideModels.forEach((model) => {
+        if (model.type === 'horizontal' && isFinite(model.y)) horizontalYs.push(model.y);
+        if (model.type === 'oblique' && isFinite(model.m) && isFinite(model.b)) obliqueLines.push({ m: model.m, b: model.b });
+    });
+
+    const uniqueHorizontal = [];
+    horizontalYs.sort((a, b) => a - b).forEach((y) => {
+        if (!uniqueHorizontal.some((v) => Math.abs(v - y) < 0.08)) uniqueHorizontal.push(y);
+    });
+
+    const uniqueOblique = [];
+    obliqueLines.forEach((line) => {
+        const exists = uniqueOblique.some((v) => {
+            const similarM = Math.abs(v.m - line.m) < 0.03;
+            const similarB = Math.abs(v.b - line.b) < Math.max(0.35, Math.abs(line.b) * 0.06);
+            return similarM && similarB;
+        });
+        if (!exists) uniqueOblique.push(line);
+    });
+
+    return { horizontalYs: uniqueHorizontal, obliqueLines: uniqueOblique };
+}
+
+function getAutoAsymptotes(compiled) {
+    const minX = screenToWorldX(0);
+    const maxX = screenToWorldX(canvas.width);
+    const cacheKey = `${minX.toFixed(5)}|${maxX.toFixed(5)}|${state.scaleX.toFixed(4)}|${state.scaleY.toFixed(4)}|${canvas.width}x${canvas.height}`;
+
+    if (compiled._autoAsymptotes && compiled._autoAsymptotes.key === cacheKey) {
+        return compiled._autoAsymptotes;
+    }
+
+    const verticalXs = findVerticalAsymptotes(compiled.fn, minX, maxX);
+    const linear = detectLinearAsymptotes(compiled.fn, minX, maxX);
+    compiled._autoAsymptotes = {
+        key: cacheKey,
+        verticalXs,
+        horizontalYs: linear.horizontalYs,
+        obliqueLines: linear.obliqueLines
+    };
+    return compiled._autoAsymptotes;
+}
+
+function getAsymptoteColor(kind) {
+    const isDark = getResolvedTheme() === 'dark';
+    const paletteDark = {
+        vertical: '#fb7185',
+        horizontal: '#34d399',
+        oblique: '#fbbf24'
+    };
+    const paletteLight = {
+        vertical: '#e11d48',
+        horizontal: '#047857',
+        oblique: '#b45309'
+    };
+    const palette = isDark ? paletteDark : paletteLight;
+    return palette[kind] || palette.oblique;
+}
+
+function isAsymptoteOnAxis(value, axis) {
+    if (!isFinite(value)) return false;
+    const axisScale = axis === 'x' ? state.scaleX : state.scaleY;
+    const safeScale = Math.max(axisScale, 1e-6);
+    const toleranceWorld = Math.max(1e-9, 2 / safeScale);
+    return Math.abs(value) <= toleranceWorld;
+}
+
+function drawVerticalGuideLines(xs, alpha = 0.75) {
+    if (!Array.isArray(xs) || !xs.length) return;
+    ctx.save();
+    ctx.setLineDash([8, 6]);
+    ctx.strokeStyle = hexToRgba(getAsymptoteColor('vertical'), alpha);
+
+    for (const x of xs) {
+        if (!isFinite(x)) continue;
+        const sx = worldToScreenX(x);
+        if (sx < -20 || sx > canvas.width + 20) continue;
+        ctx.lineWidth = isAsymptoteOnAxis(x, 'x') ? 3.2 : 1.5;
+        ctx.beginPath();
+        ctx.moveTo(sx, 0);
+        ctx.lineTo(sx, canvas.height);
+        ctx.stroke();
+    }
+
+    ctx.restore();
+}
+
+function drawHorizontalGuideLines(ys, alpha = 0.68) {
+    if (!Array.isArray(ys) || !ys.length) return;
+    ctx.save();
+    ctx.setLineDash([8, 6]);
+    ctx.strokeStyle = hexToRgba(getAsymptoteColor('horizontal'), alpha);
+
+    for (const y of ys) {
+        if (!isFinite(y)) continue;
+        const sy = worldToScreenY(y);
+        if (sy < -20 || sy > canvas.height + 20) continue;
+        ctx.lineWidth = isAsymptoteOnAxis(y, 'y') ? 3.2 : 1.5;
+        ctx.beginPath();
+        ctx.moveTo(0, sy);
+        ctx.lineTo(canvas.width, sy);
+        ctx.stroke();
+    }
+
+    ctx.restore();
+}
+
+function drawObliqueGuideLines(lines, alpha = 0.68) {
+    if (!Array.isArray(lines) || !lines.length) return;
+    const minX = screenToWorldX(0);
+    const maxX = screenToWorldX(canvas.width);
+
+    ctx.save();
+    ctx.setLineDash([8, 6]);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = hexToRgba(getAsymptoteColor('oblique'), alpha);
+
+    for (const line of lines) {
+        if (!line || !isFinite(line.m) || !isFinite(line.b)) continue;
+        const y1 = (line.m * minX) + line.b;
+        const y2 = (line.m * maxX) + line.b;
+        if (!isFinite(y1) || !isFinite(y2)) continue;
+
+        const sy1 = worldToScreenY(y1);
+        const sy2 = worldToScreenY(y2);
+        const bothAbove = sy1 < -120 && sy2 < -120;
+        const bothBelow = sy1 > canvas.height + 120 && sy2 > canvas.height + 120;
+        if (bothAbove || bothBelow) continue;
+
+        ctx.beginPath();
+        ctx.moveTo(0, sy1);
+        ctx.lineTo(canvas.width, sy2);
+        ctx.stroke();
+    }
+
+    ctx.restore();
+}
+
+function drawFunctionAutoAsymptotes(compiled) {
+    if (!showAutoAsymptotes || !compiled || compiled.type !== 'function') return;
+    const auto = getAutoAsymptotes(compiled);
+    drawVerticalGuideLines(auto.verticalXs, 0.7);
+    drawHorizontalGuideLines(auto.horizontalYs, 0.65);
+    drawObliqueGuideLines(auto.obliqueLines, 0.65);
+}
+
+function drawAuxiliaryAsymptote(compiled) {
+    if (!compiled || compiled.type !== 'aux-asymptote') return;
+
+    const kindForColor = compiled.kind === 'vertical'
+        ? 'vertical'
+        : compiled.kind === 'horizontal'
+            ? 'horizontal'
+            : 'oblique';
+
+    ctx.save();
+    ctx.setLineDash([10, 6]);
+    ctx.lineWidth = 1.8;
+    ctx.strokeStyle = hexToRgba(getAsymptoteColor(kindForColor), 0.85);
+
+    if (compiled.kind === 'vertical' && isFinite(compiled.x)) {
+        ctx.lineWidth = isAsymptoteOnAxis(compiled.x, 'x') ? 3.4 : 1.8;
+        const sx = worldToScreenX(compiled.x);
+        if (sx >= -30 && sx <= canvas.width + 30) {
+            ctx.beginPath();
+            ctx.moveTo(sx, 0);
+            ctx.lineTo(sx, canvas.height);
+            ctx.stroke();
+        }
+        ctx.restore();
+        return;
+    }
+
+    if (compiled.kind === 'horizontal' && isFinite(compiled.y)) {
+        ctx.lineWidth = isAsymptoteOnAxis(compiled.y, 'y') ? 3.4 : 1.8;
+        const sy = worldToScreenY(compiled.y);
+        if (sy >= -30 && sy <= canvas.height + 30) {
+            ctx.beginPath();
+            ctx.moveTo(0, sy);
+            ctx.lineTo(canvas.width, sy);
+            ctx.stroke();
+        }
+        ctx.restore();
+        return;
+    }
+
+    if (compiled.kind === 'line' && typeof compiled.fn === 'function') {
+        const minX = screenToWorldX(0);
+        const maxX = screenToWorldX(canvas.width);
+        const steps = Math.max(120, Math.floor(canvas.width / 3));
+        const step = (maxX - minX) / steps;
+        let isDrawing = false;
+
+        ctx.beginPath();
+        for (let i = 0; i <= steps; i++) {
+            const x = minX + i * step;
+            const y = evaluateCartesianFunction(compiled.fn, x);
+            if (!isFinite(y)) {
+                isDrawing = false;
+                continue;
+            }
+            const sx = worldToScreenX(x);
+            const sy = worldToScreenY(y);
+            if (!isDrawing) {
+                ctx.moveTo(sx, sy);
+                isDrawing = true;
+            } else {
+                ctx.lineTo(sx, sy);
+            }
+        }
+        ctx.stroke();
+    }
+
+    ctx.restore();
 }
 
 function bisect(fn, a, b, fa, fb) {
@@ -1396,8 +2535,18 @@ function drawIntersectionMarkers(intersections, color) {
     ctx.restore();
 }
 
+function getReferenceStep(x) {
+    const scaleX = Math.max(state.scaleX, MIN_SCALE);
+    const worldPerPixelX = 1 / scaleX;
+    return Math.max(1e-4, worldPerPixelX * 1.5, Math.abs(x) * 1e-6);
+}
+
+function getReferenceYTolerance() {
+    return Math.max(1e-4, 2 / Math.max(state.scaleY, MIN_SCALE));
+}
+
 function numericalDerivative(fn, x) {
-    const h = 1e-5;
+    const h = getReferenceStep(x);
     try {
         const yp = fn(x + h);
         const ym = fn(x - h);
@@ -1407,7 +2556,7 @@ function numericalDerivative(fn, x) {
 }
 
 function numericalSecondDerivative(fn, x) {
-    const h = 1e-5;
+    const h = getReferenceStep(x);
     try {
         const yp = fn(x + h);
         const y0 = fn(x);
@@ -1422,14 +2571,19 @@ function findCriticalPoints(fn) {
     const maxX = screenToWorldX(canvas.width);
     const SAMPLES = 500;
     const step = (maxX - minX) / SAMPLES;
+    if (!isFinite(step) || step <= 0) return [];
     const MAX_POINTS = 20;
     const results = [];
+    const yTolerance = getReferenceYTolerance();
+    const slopeNoise = yTolerance / Math.max(step, 1e-9);
+    const probeX = Math.max(step * 1.5, 4 / Math.max(state.scaleX, MIN_SCALE));
     let prevX = minX;
     let prevD = numericalDerivative(fn, prevX);
     for (let i = 1; i <= SAMPLES && results.length < MAX_POINTS; i++) {
         const x = minX + i * step;
         const d = numericalDerivative(fn, x);
-        if (isFinite(prevD) && isFinite(d) && prevD * d < 0) {
+        const derivativeLooksSignificant = Math.max(Math.abs(prevD), Math.abs(d)) > slopeNoise;
+        if (isFinite(prevD) && isFinite(d) && prevD * d < 0 && derivativeLooksSignificant) {
             let a = prevX, b = x, fa = prevD;
             for (let iter = 0; iter < 50; iter++) {
                 const mid = (a + b) / 2;
@@ -1441,11 +2595,21 @@ function findCriticalPoints(fn) {
             const cx = (a + b) / 2;
             if (!results.some(p => Math.abs(p.x - cx) < step * 0.5)) {
                 let cy;
+                let yLeft;
+                let yRight;
                 try { cy = fn(cx); } catch { cy = NaN; }
-                if (isFinite(cy)) {
-                    const d2 = numericalSecondDerivative(fn, cx);
-                    const kind = isFinite(d2) && d2 < 0 ? 'max' : 'min';
-                    results.push({ x: cx, y: cy, kind });
+                try { yLeft = fn(cx - probeX); } catch { yLeft = NaN; }
+                try { yRight = fn(cx + probeX); } catch { yRight = NaN; }
+                if (!isFinite(cy) || !isFinite(yLeft) || !isFinite(yRight)) {
+                    prevX = x;
+                    prevD = d;
+                    continue;
+                }
+
+                const isMax = (cy - yLeft) > yTolerance && (cy - yRight) > yTolerance;
+                const isMin = (yLeft - cy) > yTolerance && (yRight - cy) > yTolerance;
+                if (isMax || isMin) {
+                    results.push({ x: cx, y: cy, kind: isMax ? 'max' : 'min' });
                 }
             }
         }
@@ -1460,14 +2624,19 @@ function findInflectionPoints(fn) {
     const maxX = screenToWorldX(canvas.width);
     const SAMPLES = 500;
     const step = (maxX - minX) / SAMPLES;
+    if (!isFinite(step) || step <= 0) return [];
     const MAX_POINTS = 20;
     const results = [];
+    const yTolerance = getReferenceYTolerance();
+    const curvatureNoise = yTolerance / Math.max(step * step, 1e-9);
+    const probeX = Math.max(step * 2, 6 / Math.max(state.scaleX, MIN_SCALE));
     let prevX = minX;
     let prevD2 = numericalSecondDerivative(fn, prevX);
     for (let i = 1; i <= SAMPLES && results.length < MAX_POINTS; i++) {
         const x = minX + i * step;
         const d2 = numericalSecondDerivative(fn, x);
-        if (isFinite(prevD2) && isFinite(d2) && prevD2 * d2 < 0) {
+        const curvatureLooksSignificant = Math.max(Math.abs(prevD2), Math.abs(d2)) > curvatureNoise;
+        if (isFinite(prevD2) && isFinite(d2) && prevD2 * d2 < 0 && curvatureLooksSignificant) {
             let a = prevX, b = x, fa = prevD2;
             for (let iter = 0; iter < 50; iter++) {
                 const mid = (a + b) / 2;
@@ -1479,8 +2648,22 @@ function findInflectionPoints(fn) {
             const ix = (a + b) / 2;
             if (!results.some(p => Math.abs(p.x - ix) < step * 0.5)) {
                 let iy;
+                let d2Left;
+                let d2Right;
                 try { iy = fn(ix); } catch { iy = NaN; }
-                if (isFinite(iy)) results.push({ x: ix, y: iy });
+                try { d2Left = numericalSecondDerivative(fn, ix - probeX); } catch { d2Left = NaN; }
+                try { d2Right = numericalSecondDerivative(fn, ix + probeX); } catch { d2Right = NaN; }
+                if (!isFinite(iy) || !isFinite(d2Left) || !isFinite(d2Right)) {
+                    prevX = x;
+                    prevD2 = d2;
+                    continue;
+                }
+
+                const changesCurvatureSide = d2Left * d2Right < 0;
+                const hasVisibleCurvature = Math.max(Math.abs(d2Left), Math.abs(d2Right)) > curvatureNoise;
+                if (changesCurvatureSide && hasVisibleCurvature) {
+                    results.push({ x: ix, y: iy });
+                }
             }
         }
         prevX = x;
@@ -1489,7 +2672,7 @@ function findInflectionPoints(fn) {
     return results;
 }
 
-function drawRefLabel(sx, sy, label, color, isDark, preferSide) {
+function drawRefLabel(sx, sy, label, color, isDark, preferSide, occupiedRects = null) {
     const tw = ctx.measureText(label).width;
     const ph = 7;
     const bw = tw + ph * 2;
@@ -1502,6 +2685,18 @@ function drawRefLabel(sx, sy, label, color, isDark, preferSide) {
     if (lx + bw > canvas.width - 5) lx = canvas.width - bw - 5;
     if (ly < 5) ly = sy + 10;
     if (ly + bh > canvas.height - 5) ly = sy - bh - 5;
+
+    if (Array.isArray(occupiedRects)) {
+        const overlapsExisting = occupiedRects.some((rect) => (
+            lx < rect.x + rect.w + 4 &&
+            lx + bw + 4 > rect.x &&
+            ly < rect.y + rect.h + 4 &&
+            ly + bh + 4 > rect.y
+        ));
+        if (overlapsExisting) return false;
+        occupiedRects.push({ x: lx, y: ly, w: bw, h: bh });
+    }
+
     const bgColor = isDark ? 'rgba(2,6,23,0.9)' : 'rgba(255,255,255,0.93)';
     const textColor = isDark ? '#e2e8f0' : '#0f172a';
     ctx.fillStyle = bgColor;
@@ -1515,6 +2710,7 @@ function drawRefLabel(sx, sy, label, color, isDark, preferSide) {
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
     ctx.fillText(label, lx + ph, ly + bh / 2);
+    return true;
 }
 
 function drawKeyReferencePoints(fn, color) {
@@ -1523,6 +2719,7 @@ function drawKeyReferencePoints(fn, color) {
     const inflections = findInflectionPoints(fn);
     if (!criticals.length && !inflections.length) return;
     const isDark = getResolvedTheme() === 'dark';
+    const usedLabelRects = [];
     ctx.save();
     ctx.font = "bold 11px 'Inter', ui-sans-serif, system-ui, sans-serif";
     // Critical points: filled square (■)
@@ -1536,7 +2733,15 @@ function drawKeyReferencePoints(fn, color) {
         ctx.strokeStyle = isDark ? '#f8fafc' : '#0f172a';
         ctx.lineWidth = 1.5;
         ctx.strokeRect(sx - r, sy - r, r * 2, r * 2);
-        if (showRefCoords) drawRefLabel(sx, sy, `(${formatCoord(pt.x)}, ${formatCoord(pt.y)})`, color, isDark, pt.kind === 'max' ? 'above' : 'below');
+        if (showRefCoords) drawRefLabel(
+            sx,
+            sy,
+            `(${formatCoord(pt.x)}, ${formatCoord(pt.y)})`,
+            color,
+            isDark,
+            pt.kind === 'max' ? 'above' : 'below',
+            usedLabelRects
+        );
     }
     // Inflection points: diamond (◇)
     for (const pt of inflections) {
@@ -1555,9 +2760,46 @@ function drawKeyReferencePoints(fn, color) {
         ctx.strokeStyle = isDark ? '#f8fafc' : '#0f172a';
         ctx.lineWidth = 1.5;
         ctx.stroke();
-        if (showRefCoords) drawRefLabel(sx, sy, `(${formatCoord(pt.x)}, ${formatCoord(pt.y)})`, color, isDark, 'right');
+        if (showRefCoords) drawRefLabel(
+            sx,
+            sy,
+            `(${formatCoord(pt.x)}, ${formatCoord(pt.y)})`,
+            color,
+            isDark,
+            'right',
+            usedLabelRects
+        );
     }
     ctx.restore();
+}
+
+function drawAttractor(compiled, color) {
+    const { xNextFn, yNextFn, x0, y0, iterations } = compiled;
+    const W = canvas.width;
+    const H = canvas.height;
+    const savedAlpha = ctx.globalAlpha;
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = color;
+    let x = x0;
+    let y = y0;
+    for (let i = 0; i < iterations; i++) {
+        let nx, ny;
+        try {
+            nx = xNextFn({ x, y });
+            ny = yNextFn({ x, y });
+        } catch {
+            break;
+        }
+        x = nx;
+        y = ny;
+        if (!isFinite(x) || !isFinite(y)) break;
+        if (i < 100) continue; // skip transient
+        const sx = worldToScreenX(x);
+        const sy = worldToScreenY(y);
+        if (sx < -1 || sx > W + 1 || sy < -1 || sy > H + 1) continue;
+        ctx.fillRect(sx - 0.5, sy - 0.5, 1, 1);
+    }
+    ctx.globalAlpha = savedAlpha;
 }
 
 function drawParametric(compiled, color) {
@@ -1616,8 +2858,9 @@ function drawPolar(compiled, color) {
 
 function drawImplicit(compiled, color) {
     const fn = compiled.fn;
-    const stepPx = state.scale < 20 ? 2 : state.scale < 50 ? 3 : 4;
-    const stepWorld = stepPx / state.scale;
+    const effectiveScale = Math.max(Math.min(state.scaleX, state.scaleY), MIN_SCALE);
+    const stepPx = effectiveScale < 20 ? 2 : effectiveScale < 50 ? 3 : 4;
+    const stepWorld = stepPx / effectiveScale;
     const minX = screenToWorldX(0);
     const maxX = screenToWorldX(canvas.width);
     const minY = screenToWorldY(canvas.height);
@@ -1713,23 +2956,36 @@ function drawTextMarker(el) {
     ctx.fill();
 }
 
+function escapeHtmlAttribute(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/'/g, '&#39;');
+}
+
 function renderElementsList() {
     const container = document.getElementById('elements-container');
     container.innerHTML = '';
     elements.forEach((el, index) => {
         const div = document.createElement('div');
+        const safeContent = escapeHtmlAttribute(String(el.content ?? '').replace(/\r?\n/g, ' '));
+        const safeColor = /^#[0-9a-fA-F]{6}$/.test(String(el.color || '').trim())
+            ? String(el.color).trim()
+            : '#3b82f6';
         div.className = `bg-slate-800 p-2 rounded border-l-4 border-slate-700 mb-2 flex items-center gap-2`;
-        div.style.borderLeftColor = el.color;
+        div.style.borderLeftColor = safeColor;
         let inputHtml = el.type === 'function'
-            ? `<input type="text" value="${el.content}" oninput="updateContent(${index}, this.value)" class="flex-1 bg-slate-900 border-none text-slate-200 text-sm h-8 px-2 rounded font-mono focus:ring-1 focus:ring-blue-500 outline-none" placeholder="y = sin(x) | x = cos(t), y = sin(t), t in [0, 2*pi]">`
-            : `<input type="text" value="${el.content}" oninput="updateContent(${index}, this.value)" class="flex-1 bg-slate-900 border-none text-slate-200 text-sm h-8 px-2 rounded font-sans focus:ring-1 focus:ring-emerald-500 outline-none" placeholder="Etiqueta...">`;
+            ? `<input type="text" value="${safeContent}" oninput="updateContent(${index}, this.value)" class="flex-1 bg-slate-900 border-none text-slate-200 text-sm h-8 px-2 rounded font-mono focus:ring-1 focus:ring-blue-500 outline-none" placeholder="y = sin(x) | y = log_{2}(x) | (sin(3t), sin(4t))">`
+            : `<input type="text" value="${safeContent}" oninput="updateContent(${index}, this.value)" class="flex-1 bg-slate-900 border-none text-slate-200 text-sm h-8 px-2 rounded font-sans focus:ring-1 focus:ring-emerald-500 outline-none" placeholder="Etiqueta...">`;
 
         div.innerHTML = `
             <div class="flex flex-col gap-1 w-full">
                 <div class="flex justify-between items-center">
                     <span class="text-[10px] text-slate-500 font-bold uppercase">${el.type === 'function' ? 'FUNC' : 'LBL'}</span>
                     <div class="flex gap-3">
-                        <input type="color" value="${el.color}" oninput="setElementColor(${index}, this.value)" class="color-swatch" aria-label="Color">
+                        <input type="color" value="${safeColor}" oninput="setElementColor(${index}, this.value)" class="color-swatch" aria-label="Color">
                         <button onclick="toggleVisibility(${index})"><i class="fa-solid ${el.visible ? 'fa-eye' : 'fa-eye-slash'} text-xs text-slate-400"></i></button>
                         <button onclick="removeElement(${index})"><i class="fa-solid fa-times text-xs text-slate-400 hover:text-red-400"></i></button>
                     </div>
@@ -1753,14 +3009,25 @@ window.setElementColor = (i, color) => {
     scheduleDrawFrame();
     scheduleSessionSave();
 };
-window.zoomIn = () => { state.scale *= 1.2; scheduleDrawFrame(); scheduleSessionSave(); };
-window.zoomOut = () => { state.scale *= 0.8; scheduleDrawFrame(); scheduleSessionSave(); };
+window.zoomIn = () => {
+    state.scaleX = clamp(state.scaleX * 1.2, MIN_SCALE, MAX_SCALE);
+    state.scaleY = clamp(state.scaleY * 1.2, MIN_SCALE, MAX_SCALE);
+    scheduleDrawFrame();
+    scheduleSessionSave();
+};
+window.zoomOut = () => {
+    state.scaleX = clamp(state.scaleX * 0.8, MIN_SCALE, MAX_SCALE);
+    state.scaleY = clamp(state.scaleY * 0.8, MIN_SCALE, MAX_SCALE);
+    scheduleDrawFrame();
+    scheduleSessionSave();
+};
 window.downloadGraph = downloadGraph;
 
 function drawImplicitToContext(targetCtx, compiled, color) {
     const fn = compiled.fn;
-    const stepPx = state.scale < 20 ? 2 : state.scale < 50 ? 3 : 4;
-    const stepWorld = stepPx / state.scale;
+    const effectiveScale = Math.max(Math.min(state.scaleX, state.scaleY), MIN_SCALE);
+    const stepPx = effectiveScale < 20 ? 2 : effectiveScale < 50 ? 3 : 4;
+    const stepWorld = stepPx / effectiveScale;
     const minX = screenToWorldX(0);
     const maxX = screenToWorldX(canvas.width);
     const minY = screenToWorldY(canvas.height);
@@ -1810,12 +3077,18 @@ function drawGraphElementSync(el) {
     if (!el.content.trim()) return;
     const compiled = getCompiledElement(el);
     if (!compiled || compiled.type === 'invalid') return;
-    if (compiled.type === 'function') return drawCartesianFunction(compiled, el.color);
+    if (compiled.type === 'function') {
+        drawCartesianFunction(compiled, el.color);
+        drawFunctionAutoAsymptotes(compiled);
+        return;
+    }
+    if (compiled.type === 'aux-asymptote') return drawAuxiliaryAsymptote(compiled);
     if (compiled.type === 'parametric') return drawParametric(compiled, el.color);
     if (compiled.type === 'polar') return drawPolar(compiled, el.color);
     if (compiled.type === 'implicit') return drawImplicitToContext(ctx, compiled, el.color);
     if (compiled.type === 'segments') return compiled.segments.forEach(segment => drawParametric(segment, el.color));
     if (compiled.type === 'region') return drawRegion(compiled, el.color);
+    if (compiled.type === 'attractor') return drawAttractor(compiled, el.color);
 }
 
 function renderExportFrame() {
@@ -1823,9 +3096,10 @@ function renderExportFrame() {
     const palette = getThemePalette();
     ctx.fillStyle = palette.bg;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    const step = calculateStep(state.scale);
-    drawGrid(step);
-    drawAxes(step);
+    const stepX = calculateStep(state.scaleX);
+    const stepY = calculateStep(state.scaleY);
+    drawGrid(stepX, stepY);
+    drawAxes(stepX, stepY);
 
     const functionEls = elements.filter(e => e.type === 'function' && e.visible);
     const textEls = elements.filter(e => e.type === 'text' && e.visible);
@@ -1867,35 +3141,37 @@ function calculateStep(scale) {
     if (scale > 80) step = 0.5; if (scale > 150) step = 0.1;
     return step;
 }
-function drawGrid(step) {
+function drawGrid(stepX, stepY) {
     const palette = getThemePalette();
     const { width, height } = canvas;
-    const { scale, offsetX, offsetY } = state;
-    const startX = -offsetX / scale; const endX = (width - offsetX) / scale;
-    const minWorldY = (offsetY - height) / scale; const maxWorldY = offsetY / scale;
+    const { scaleX, scaleY, offsetX, offsetY } = state;
+    const startX = -offsetX / scaleX;
+    const endX = (width - offsetX) / scaleX;
+    const minWorldY = (offsetY - height) / scaleY;
+    const maxWorldY = offsetY / scaleY;
     ctx.lineWidth = 1;
-    for (let x = Math.floor(startX / step) * step; x <= endX; x += step) {
+    for (let x = Math.floor(startX / stepX) * stepX; x <= endX; x += stepX) {
         const screenX = worldToScreenX(x);
-        ctx.beginPath(); ctx.strokeStyle = (Math.abs(x % (step * 5)) < 0.001) ? palette.gridMajor : palette.gridMinor;
+        ctx.beginPath(); ctx.strokeStyle = (Math.abs(x % (stepX * 5)) < 0.001) ? palette.gridMajor : palette.gridMinor;
         ctx.moveTo(screenX, 0); ctx.lineTo(screenX, height); ctx.stroke();
     }
-    for (let y = Math.floor(minWorldY / step) * step; y <= maxWorldY; y += step) {
+    for (let y = Math.floor(minWorldY / stepY) * stepY; y <= maxWorldY; y += stepY) {
         const screenY = worldToScreenY(y);
-        ctx.beginPath(); ctx.strokeStyle = (Math.abs(y % (step * 5)) < 0.001) ? palette.gridMajor : palette.gridMinor;
+        ctx.beginPath(); ctx.strokeStyle = (Math.abs(y % (stepY * 5)) < 0.001) ? palette.gridMajor : palette.gridMinor;
         ctx.moveTo(0, screenY); ctx.lineTo(width, screenY); ctx.stroke();
     }
 }
-function drawAxes(step) {
+function drawAxes(stepX, stepY) {
     const palette = getThemePalette();
     const { width, height } = canvas;
-    const { scale, offsetX, offsetY } = state;
+    const { scaleX, scaleY, offsetX, offsetY } = state;
     ctx.lineWidth = 2; ctx.strokeStyle = palette.axis; ctx.fillStyle = palette.label;
     ctx.font = "10px 'Inter', ui-sans-serif, system-ui, sans-serif"; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
     const originY = worldToScreenY(0); const originX = worldToScreenX(0);
 
     if (originY >= -20 && originY <= height + 20) { ctx.beginPath(); ctx.moveTo(0, originY); ctx.lineTo(width, originY); ctx.stroke(); }
-    const startX = -offsetX / scale; const endX = (width - offsetX) / scale;
-    for (let x = Math.floor(startX / step) * step; x <= endX; x += step) {
+    const startX = -offsetX / scaleX; const endX = (width - offsetX) / scaleX;
+    for (let x = Math.floor(startX / stepX) * stepX; x <= endX; x += stepX) {
         if (Math.abs(x) < 0.001) continue;
         const screenX = worldToScreenX(x);
         ctx.beginPath(); ctx.moveTo(screenX, originY - 3); ctx.lineTo(screenX, originY + 3); ctx.stroke();
@@ -1903,9 +3179,9 @@ function drawAxes(step) {
         ctx.fillText(formatNumber(x), screenX, labelY);
     }
     if (originX >= -20 && originX <= width + 20) { ctx.beginPath(); ctx.moveTo(originX, 0); ctx.lineTo(originX, height); ctx.stroke(); }
-    const minWorldY = (offsetY - height) / scale; const maxWorldY = offsetY / scale;
+    const minWorldY = (offsetY - height) / scaleY; const maxWorldY = offsetY / scaleY;
     ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
-    for (let y = Math.floor(minWorldY / step) * step; y <= maxWorldY; y += step) {
+    for (let y = Math.floor(minWorldY / stepY) * stepY; y <= maxWorldY; y += stepY) {
         if (Math.abs(y) < 0.001) continue;
         const screenY = worldToScreenY(y);
         ctx.beginPath(); ctx.moveTo(originX - 3, screenY); ctx.lineTo(originX + 3, screenY); ctx.stroke();
@@ -1914,9 +3190,9 @@ function drawAxes(step) {
     }
 }
 function formatNumber(n) { return Number.isInteger(n) ? n.toString() : n.toFixed(1).replace(/\.0$/, ''); }
-function worldToScreenX(wx) { return (wx * state.scale) + state.offsetX; }
-function worldToScreenY(wy) { return state.offsetY - (wy * state.scale); }
-function screenToWorldX(sx) { return (sx - state.offsetX) / state.scale; }
-function screenToWorldY(sy) { return (state.offsetY - sy) / state.scale; }
+function worldToScreenX(wx) { return (wx * state.scaleX) + state.offsetX; }
+function worldToScreenY(wy) { return state.offsetY - (wy * state.scaleY); }
+function screenToWorldX(sx) { return (sx - state.offsetX) / state.scaleX; }
+function screenToWorldY(sy) { return (state.offsetY - sy) / state.scaleY; }
 
 init();

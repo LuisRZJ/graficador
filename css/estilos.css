@@ -30,6 +30,7 @@ html[data-theme="light"] .text-slate-600 { color: #64748b !important; }
 html[data-theme="light"] .border-slate-800 { border-color: #e2e8f0 !important; }
 html[data-theme="light"] .border-slate-700 { border-color: #cbd5e1 !important; }
 html[data-theme="light"] [class*="bg-slate-900/80"] { background-color: rgba(255, 255, 255, 0.85) !important; }
+html[data-theme="light"] [class*="bg-slate-900/90"] { background-color: rgba(255, 255, 255, 0.92) !important; }
 html[data-theme="light"] [class*="bg-slate-800/90"] { background-color: rgba(241, 245, 249, 0.9) !important; }
 html[data-theme="light"] .btn-panel { color: #334155 !important; }
 html[data-theme="light"] .btn-panel:hover { color: #0f172a !important; }
@@ -51,6 +52,7 @@ html[data-theme="light"] .btn-panel:hover { color: #0f172a !important; }
     html[data-theme="auto"] .border-slate-800 { border-color: #e2e8f0 !important; }
     html[data-theme="auto"] .border-slate-700 { border-color: #cbd5e1 !important; }
     html[data-theme="auto"] [class*="bg-slate-900/80"] { background-color: rgba(255, 255, 255, 0.85) !important; }
+    html[data-theme="auto"] [class*="bg-slate-900/90"] { background-color: rgba(255, 255, 255, 0.92) !important; }
     html[data-theme="auto"] [class*="bg-slate-800/90"] { background-color: rgba(241, 245, 249, 0.9) !important; }
     html[data-theme="auto"] .btn-panel { color: #334155 !important; }
     html[data-theme="auto"] .btn-panel:hover { color: #0f172a !important; }

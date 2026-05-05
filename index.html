@@ -91,6 +91,14 @@
                 </div>
             </div>
             <div class="mt-3 border-t border-slate-700 pt-3 space-y-2">
+                <p class="text-xs text-slate-500 font-bold uppercase">Funciones auxiliares</p>
+                <div class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2">
+                    <input id="show-auto-asymptotes" type="checkbox" class="accent-blue-500" onchange="onShowAutoAsymptotesChange(this.checked)">
+                    <label for="show-auto-asymptotes" class="flex-1 text-sm text-slate-200">Asíntotas automáticas</label>
+                </div>
+                <p class="text-[11px] text-slate-500 px-1">Vertical: rojo, horizontal: verde, oblicua: ámbar.</p>
+            </div>
+            <div class="mt-3 border-t border-slate-700 pt-3 space-y-2">
                 <p class="text-xs text-slate-500 font-bold uppercase">Coordenadas visibles</p>
                 <div class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2">
                     <input id="show-axis-coords" type="checkbox" class="accent-blue-500" onchange="onShowAxisCoordsChange(this.checked)">
@@ -159,6 +167,10 @@
             <span>X: <span id="coord-x" class="text-white">0.00</span></span>
             <span>Y: <span id="coord-y" class="text-white">0.00</span></span>
         </div>
+
+        <button id="axis-reset-button" onclick="resetView()" class="hidden absolute top-4 left-4 z-20 pointer-events-auto px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-900/90 text-slate-200 text-xs font-medium backdrop-blur hover:bg-slate-800 active:bg-slate-700 shadow-lg">
+            <i class="fa-solid fa-rotate-left"></i> Restablecer vista
+        </button>
 
         <canvas id="graphCanvas" class="block w-full h-full cursor-crosshair touch-none"></canvas>
         
