@@ -59,11 +59,21 @@ let state = {
     axisScalePointerStart: 0,
     axisScaleMoved: false,
     lastMouseX: 0,
-    lastMouseY: 0
+    lastMouseY: 0,
+    breakPlacementElementId: null
 };
 
 let elements = [
-    { id: 1, type: 'function', content: 'sin(x)', color: '#3b82f6', visible: true },
+    {
+        id: 1,
+        type: 'function',
+        content: 'sin(x)',
+        color: '#3b82f6',
+        visible: true,
+        strokeWidth: 2,
+        lineStyle: 'solid',
+        manualBreaks: []
+    },
     { id: 2, type: 'text', content: 'Zona Compra', x: 2, y: 1.5, color: '#10b981', visible: true }
 ];
 
@@ -81,6 +91,82 @@ let pendingDrawFrameId = 0;
 const SESSION_STORAGE_KEY = 'graficador.session.v1';
 const SESSION_SAVE_DEBOUNCE_MS = 250;
 let pendingSessionSaveId = 0;
+
+const DEFAULT_FUNCTION_STROKE_WIDTH = 2;
+const MIN_FUNCTION_STROKE_WIDTH = 0.5;
+const MAX_FUNCTION_STROKE_WIDTH = 6;
+const MAX_MANUAL_BREAKS_PER_FUNCTION = 30;
+const FUNCTION_LINE_STYLE_PATTERNS = {
+    solid: [],
+    dashed: [8, 6],
+    dotted: [2, 6],
+    dashdot: [10, 5, 2, 5]
+};
+const FUNCTION_LINE_STYLE_VALUES = new Set(Object.keys(FUNCTION_LINE_STYLE_PATTERNS));
+
+function sanitizeHexColor(color, fallback = '#3b82f6') {
+    const value = String(color || '').trim();
+    return /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback;
+}
+
+function sanitizeStrokeWidth(value, fallback = DEFAULT_FUNCTION_STROKE_WIDTH) {
+    const n = Number(value);
+    if (!isFinite(n)) return fallback;
+    return clamp(n, MIN_FUNCTION_STROKE_WIDTH, MAX_FUNCTION_STROKE_WIDTH);
+}
+
+function sanitizeLineStyle(value) {
+    const style = String(value || 'solid').trim().toLowerCase();
+    return FUNCTION_LINE_STYLE_VALUES.has(style) ? style : 'solid';
+}
+
+function sanitizeManualBreakList(value) {
+    if (!Array.isArray(value)) return [];
+
+    const normalized = value
+        .map((entry) => {
+            const rawX = entry && typeof entry === 'object' ? entry.x : entry;
+            const rawY = entry && typeof entry === 'object' ? entry.y : NaN;
+            const x = Number(rawX);
+            const y = Number(rawY);
+            if (!isFinite(x)) return null;
+            const point = { x };
+            if (isFinite(y)) point.y = y;
+            return point;
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.x - b.x);
+
+    const deduped = [];
+    for (const point of normalized) {
+        if (!deduped.length || Math.abs(deduped[deduped.length - 1].x - point.x) > 1e-6) {
+            deduped.push(point);
+        }
+        if (deduped.length >= MAX_MANUAL_BREAKS_PER_FUNCTION) break;
+    }
+    return deduped;
+}
+
+function getElementStrokeWidth(element, fallback = DEFAULT_FUNCTION_STROKE_WIDTH) {
+    return sanitizeStrokeWidth(element ? element.strokeWidth : NaN, fallback);
+}
+
+function getElementLineStyle(element) {
+    return sanitizeLineStyle(element ? element.lineStyle : 'solid');
+}
+
+function getElementManualBreaks(element) {
+    return sanitizeManualBreakList(element ? element.manualBreaks : []);
+}
+
+function applyElementStrokeStyle(targetCtx, element, fallbackWidth = DEFAULT_FUNCTION_STROKE_WIDTH) {
+    targetCtx.lineWidth = getElementStrokeWidth(element, fallbackWidth);
+    targetCtx.setLineDash(FUNCTION_LINE_STYLE_PATTERNS[getElementLineStyle(element)] || []);
+}
+
+function resetStrokeStyle(targetCtx) {
+    targetCtx.setLineDash([]);
+}
 
 function scheduleSessionSave() {
     if (pendingSessionSaveId) window.clearTimeout(pendingSessionSaveId);
@@ -101,10 +187,14 @@ function serializeElementsForSession(list) {
                 id: typeof el.id === 'number' ? el.id : Date.now(),
                 type: el.type,
                 content: String(el.content ?? ''),
-                color: /^#[0-9a-fA-F]{6}$/.test(String(el.color || '')) ? el.color : '#3b82f6',
+                color: sanitizeHexColor(el.color),
                 visible: el.visible !== false
             };
-            if (el.type === 'text') {
+            if (el.type === 'function') {
+                base.strokeWidth = sanitizeStrokeWidth(el.strokeWidth);
+                base.lineStyle = sanitizeLineStyle(el.lineStyle);
+                base.manualBreaks = sanitizeManualBreakList(el.manualBreaks);
+            } else if (el.type === 'text') {
                 const x = Number(el.x);
                 const y = Number(el.y);
                 base.x = isFinite(x) ? x : 0;
@@ -1134,6 +1224,7 @@ function init() {
     window.addEventListener('resize', resizeCanvas);
     window.addEventListener('pagehide', saveSessionState);
     renderElementsList();
+    updateCanvasCursorForMode();
 
     window.addEventListener('app:themechange', () => {
         draw();
@@ -1257,6 +1348,7 @@ window.confirmClear = () => {
 
 window.executeClear = () => {
     elements = [];
+    state.breakPlacementElementId = null;
     renderElementsList();
     draw();
     closeModal('confirm-modal');
@@ -1271,6 +1363,71 @@ function setAxisResetButtonVisible(isVisible) {
     if (!axisResetButton) return;
     axisResetButton.classList.toggle('hidden', !isVisible);
     axisResetButton.setAttribute('aria-hidden', isVisible ? 'false' : 'true');
+}
+
+function updateCanvasCursorForMode() {
+    if (state.isAxisScaling || state.isDraggingCanvas || state.draggingElementId !== null) return;
+    canvas.style.cursor = state.breakPlacementElementId !== null ? 'copy' : 'crosshair';
+}
+
+function setBreakPlacementElementId(nextId, shouldRender = true) {
+    const match = elements.find((el) => el.type === 'function' && el.id === nextId && el.visible !== false);
+    state.breakPlacementElementId = match ? match.id : null;
+    if (shouldRender) renderElementsList();
+    updateCanvasCursorForMode();
+}
+
+function findClosestPointOnCartesianFunction(fn, screenX, screenY) {
+    const worldX = screenToWorldX(screenX);
+    let best = null;
+    let range = Math.max(18 / Math.max(state.scaleX, MIN_SCALE), 0.06);
+
+    for (let pass = 0; pass < 3; pass++) {
+        const samples = 84;
+        const minX = worldX - range;
+        const maxX = worldX + range;
+        for (let i = 0; i <= samples; i++) {
+            const x = minX + ((maxX - minX) * i) / samples;
+            const y = evaluateCartesianFunction(fn, x);
+            if (!isFinite(y)) continue;
+            const sx = worldToScreenX(x);
+            const sy = worldToScreenY(y);
+            const dx = sx - screenX;
+            const dy = sy - screenY;
+            const dist2 = dx * dx + dy * dy;
+            if (!best || dist2 < best.dist2) {
+                best = { x, y, sx, sy, dist2 };
+            }
+        }
+        if (!best) return null;
+        range = Math.max(range * 0.35, 4 / Math.max(state.scaleX, MIN_SCALE));
+    }
+
+    const maxDistancePx = 24;
+    if (!best || best.dist2 > maxDistancePx * maxDistancePx) return null;
+    return best;
+}
+
+function placeManualBreakAt(screenX, screenY) {
+    if (state.breakPlacementElementId === null) return false;
+    const target = elements.find((el) => el.type === 'function' && el.id === state.breakPlacementElementId);
+    if (!target || target.visible === false) return false;
+
+    const compiled = getCompiledElement(target);
+    if (!compiled || compiled.type !== 'function') return false;
+
+    const point = findClosestPointOnCartesianFunction(compiled.fn, screenX, screenY);
+    if (!point) return false;
+
+    const currentBreaks = getElementManualBreaks(target);
+    const dedupeTolerance = Math.max(4 / Math.max(state.scaleX, MIN_SCALE), 1e-4);
+    if (currentBreaks.some((entry) => Math.abs(entry.x - point.x) <= dedupeTolerance)) {
+        return false;
+    }
+
+    currentBreaks.push({ x: point.x, y: point.y });
+    target.manualBreaks = sanitizeManualBreakList(currentBreaks);
+    return true;
 }
 
 function getAxisGrabMode(mx, my) {
@@ -1303,7 +1460,16 @@ window.addElement = (type) => {
     closeModal('type-selector-modal');
     const nextColor = getNextDistinctColor();
     if (type === 'function') {
-        elements.push({ id: Date.now(), type: 'function', content: '', color: nextColor, visible: true });
+        elements.push({
+            id: Date.now(),
+            type: 'function',
+            content: '',
+            color: nextColor,
+            visible: true,
+            strokeWidth: DEFAULT_FUNCTION_STROKE_WIDTH,
+            lineStyle: 'solid',
+            manualBreaks: []
+        });
     } else {
         const centerX = screenToWorldX(canvas.width / 2);
         const centerY = screenToWorldY(canvas.height / 2);
@@ -1315,9 +1481,22 @@ window.addElement = (type) => {
 };
 
 function handleMouseDown(e) {
+    if (typeof e.button === 'number' && e.button !== 0) return;
     const rect = canvas.getBoundingClientRect();
     const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
+
+    if (state.breakPlacementElementId !== null) {
+        const placed = placeManualBreakAt(mx, my);
+        if (placed) {
+            setBreakPlacementElementId(null);
+            scheduleDrawFrame();
+            scheduleSessionSave();
+        }
+        state.lastMouseX = e.clientX;
+        state.lastMouseY = e.clientY;
+        return;
+    }
 
     const clickedText = elements.find(el => {
         if (el.type !== 'text' || !el.visible) return false;
@@ -1395,6 +1574,12 @@ function handleMouseMove(e) {
         state.offsetY += dy;
         scheduleDrawFrame();
     } else {
+        if (state.breakPlacementElementId !== null) {
+            canvas.style.cursor = 'copy';
+            state.lastMouseX = e.clientX;
+            state.lastMouseY = e.clientY;
+            return;
+        }
         const axisMode = getAxisGrabMode(mx, my);
         if (axisMode === 'x-axis') canvas.style.cursor = 'ew-resize';
         else if (axisMode === 'y-axis') canvas.style.cursor = 'ns-resize';
@@ -1415,7 +1600,7 @@ function handleMouseUp() {
     state.axisScaleMoved = false;
     state.isDraggingCanvas = false;
     state.draggingElementId = null;
-    canvas.style.cursor = 'crosshair';
+    updateCanvasCursorForMode();
 
     if (usedAxisScale) {
         setAxisResetButtonVisible(true);
@@ -1425,6 +1610,7 @@ function handleMouseUp() {
 }
 
 function handleTouchStart(e) {
+    if (e.cancelable) e.preventDefault();
     const touch = e.touches[0];
     handleMouseDown({ clientX: touch.clientX, clientY: touch.clientY });
 }
@@ -1479,7 +1665,7 @@ function ensureImplicitCanvas() {
     implicitCtx.clearRect(0, 0, implicitCanvas.width, implicitCanvas.height);
 }
 
-function createImplicitJob(compiled, color) {
+function createImplicitJob(compiled, color, element) {
     const fn = compiled.fn;
     const effectiveScale = Math.max(Math.min(state.scaleX, state.scaleY), MIN_SCALE);
     const stepPx = effectiveScale < 20 ? 2 : effectiveScale < 50 ? 3 : 4;
@@ -1491,6 +1677,8 @@ function createImplicitJob(compiled, color) {
     return {
         fn,
         color,
+        strokeWidth: getElementStrokeWidth(element, 1.5),
+        lineStyle: getElementLineStyle(element),
         stepWorld,
         minX,
         maxX,
@@ -1519,7 +1707,7 @@ function runImplicitRender(token) {
     while (implicitJobs.length && (performance.now() - start) < budgetMs) {
         const job = implicitJobs[0];
         implicitCtx.strokeStyle = job.color;
-        implicitCtx.lineWidth = 1.5;
+        applyElementStrokeStyle(implicitCtx, job, 1.5);
         implicitCtx.beginPath();
         let iterations = 0;
         while ((performance.now() - start) < budgetMs && iterations < 2500) {
@@ -1568,6 +1756,7 @@ function runImplicitRender(token) {
             iterations += 1;
         }
         implicitCtx.stroke();
+        resetStrokeStyle(implicitCtx);
         if (job.x >= job.maxX) implicitJobs.shift();
     }
 
@@ -1614,7 +1803,7 @@ function draw() {
 
     if (implicitQueue.length) {
         ensureImplicitCanvas();
-        implicitJobs = implicitQueue.map(({ compiled, color }) => createImplicitJob(compiled, color));
+        implicitJobs = implicitQueue.map(({ compiled, color, element }) => createImplicitJob(compiled, color, element));
         implicitTextElements = textEls;
         implicitMarkerElements = implicitQueue.map(({ compiled, color }) => ({
             intersections: findImplicitAxisIntersections(compiled.fn),
@@ -1641,23 +1830,24 @@ function drawGraphElement(el, implicitQueue) {
     const compiled = getCompiledElement(el);
     if (!compiled || compiled.type === 'invalid') return;
     if (compiled.type === 'function') {
-        drawCartesianFunction(compiled, el.color);
+        drawCartesianFunction(compiled, el.color, el);
         drawFunctionAutoAsymptotes(compiled);
+        drawManualBreakMarkers(compiled, el.color, el);
         return;
     }
     if (compiled.type === 'aux-asymptote') return drawAuxiliaryAsymptote(compiled);
-    if (compiled.type === 'parametric') return drawParametric(compiled, el.color);
-    if (compiled.type === 'polar') return drawPolar(compiled, el.color);
+    if (compiled.type === 'parametric') return drawParametric(compiled, el.color, el);
+    if (compiled.type === 'polar') return drawPolar(compiled, el.color, el);
     if (compiled.type === 'implicit') {
-        if (Array.isArray(implicitQueue)) implicitQueue.push({ compiled, color: el.color });
+        if (Array.isArray(implicitQueue)) implicitQueue.push({ compiled, color: el.color, element: el });
         return;
     }
-    if (compiled.type === 'segments') return compiled.segments.forEach(segment => drawParametric(segment, el.color));
-    if (compiled.type === 'region') return drawRegion(compiled, el.color);
+    if (compiled.type === 'segments') return compiled.segments.forEach(segment => drawParametric(segment, el.color, el));
+    if (compiled.type === 'region') return drawRegion(compiled, el.color, el);
     if (compiled.type === 'attractor') return drawAttractor(compiled, el.color);
 }
 
-function drawCartesianFunction(compiled, color) {
+function drawCartesianFunction(compiled, color, element) {
     const fn = compiled.fn;
     const minX = screenToWorldX(0);
     const maxX = screenToWorldX(canvas.width);
@@ -1669,9 +1859,16 @@ function drawCartesianFunction(compiled, color) {
     const maxDepth = 8;
     const minWorldStep = Math.max(worldStep / Math.pow(2, maxDepth), (maxX - minX) / Math.max(canvas.width * 20, 2200));
     const jumpDeltaPx = Math.max(canvas.height * 0.55, 55);
+    const manualBreakXs = getElementManualBreaks(element).map((point) => point.x);
+    const autoBreakXs = showAutoAsymptotes ? (getAutoAsymptotes(compiled).verticalXs || []) : [];
+    const breakXs = [...manualBreakXs, ...autoBreakXs]
+        .filter((x) => isFinite(x) && x > minX && x < maxX)
+        .sort((a, b) => a - b)
+        .filter((x, idx, arr) => idx === 0 || Math.abs(x - arr[idx - 1]) > 1e-6);
+    const manualBreakGapWorld = Math.max(2.2 / Math.max(state.scaleX, MIN_SCALE), worldStep * 0.55, 1e-4);
 
     ctx.beginPath();
-    ctx.lineWidth = 2;
+    applyElementStrokeStyle(ctx, element, 2);
     ctx.strokeStyle = color;
 
     let hasStroke = false;
@@ -1703,9 +1900,41 @@ function drawCartesianFunction(compiled, color) {
 
     const evaluateY = (x) => evaluateCartesianFunction(fn, x);
 
+    const findBreakInsideInterval = (x0, x1) => {
+        if (!breakXs.length) return NaN;
+        for (const breakX of breakXs) {
+            if (breakX > x0 && breakX < x1) return breakX;
+        }
+        return NaN;
+    };
+
     const traceInterval = (x0, y0, x1, y1, depth) => {
         const interval = x1 - x0;
         if (!(interval > 0)) return;
+
+        const manualBreakX = findBreakInsideInterval(x0, x1);
+        if (isFinite(manualBreakX)) {
+            if (depth >= maxDepth || interval <= minWorldStep * 1.1) {
+                penDown = false;
+                return;
+            }
+
+            const leftEdge = Math.max(x0, manualBreakX - manualBreakGapWorld);
+            const rightEdge = Math.min(x1, manualBreakX + manualBreakGapWorld);
+
+            if (leftEdge > x0 + 1e-12) {
+                const yLeftEdge = evaluateY(leftEdge);
+                traceInterval(x0, y0, leftEdge, yLeftEdge, depth + 1);
+            }
+
+            penDown = false;
+
+            if (rightEdge < x1 - 1e-12) {
+                const yRightEdge = evaluateY(rightEdge);
+                traceInterval(rightEdge, yRightEdge, x1, y1, depth + 1);
+            }
+            return;
+        }
 
         const y0Finite = isFinite(y0);
         const y1Finite = isFinite(y1);
@@ -1784,6 +2013,7 @@ function drawCartesianFunction(compiled, color) {
     }
 
     if (hasStroke) ctx.stroke();
+    resetStrokeStyle(ctx);
 }
 
 function evaluateCartesianFunction(fn, x) {
@@ -1793,6 +2023,41 @@ function evaluateCartesianFunction(fn, x) {
     } catch {
         return NaN;
     }
+}
+
+function drawManualBreakMarkers(compiled, color, element) {
+    if (!compiled || compiled.type !== 'function') return;
+    const breaks = getElementManualBreaks(element);
+    if (!breaks.length) return;
+
+    const background = getThemePalette().bg;
+    const radius = Math.max(4.5, getElementStrokeWidth(element, 2) * 1.8);
+
+    ctx.save();
+    resetStrokeStyle(ctx);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(1.8, getElementStrokeWidth(element, 2) * 0.9);
+    ctx.fillStyle = background;
+
+    for (const point of breaks) {
+        const x = Number(point.x);
+        if (!isFinite(x)) continue;
+
+        const curveY = evaluateCartesianFunction(compiled.fn, x);
+        const y = isFinite(curveY) ? curveY : Number(point.y);
+        if (!isFinite(y)) continue;
+
+        const sx = worldToScreenX(x);
+        const sy = worldToScreenY(y);
+        if (sx < -30 || sx > canvas.width + 30 || sy < -30 || sy > canvas.height + 30) continue;
+
+        ctx.beginPath();
+        ctx.arc(sx, sy, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+    }
+
+    ctx.restore();
 }
 
 function refineVerticalAsymptoteCandidate(fn, left, right) {
@@ -2007,8 +2272,9 @@ function detectLinearAsymptotes(fn, minX, maxX) {
     const uniqueOblique = [];
     obliqueLines.forEach((line) => {
         const exists = uniqueOblique.some((v) => {
-            const similarM = Math.abs(v.m - line.m) < 0.03;
-            const similarB = Math.abs(v.b - line.b) < Math.max(0.35, Math.abs(line.b) * 0.06);
+            const similarM = Math.abs(v.m - line.m) < 0.05;
+            const toleranceB = Math.max(0.5, Math.abs(line.b) * 0.12, Math.max(Math.abs(v.m), Math.abs(line.m), 1) * 0.08);
+            const similarB = Math.abs(v.b - line.b) < toleranceB;
             return similarM && similarB;
         });
         if (!exists) uniqueOblique.push(line);
@@ -2802,7 +3068,7 @@ function drawAttractor(compiled, color) {
     ctx.globalAlpha = savedAlpha;
 }
 
-function drawParametric(compiled, color) {
+function drawParametric(compiled, color, element) {
     const xFn = compiled.xFn;
     const yFn = compiled.yFn;
     const tMin = compiled.tMin;
@@ -2812,7 +3078,7 @@ function drawParametric(compiled, color) {
     const steps = Math.max(200, Math.min(2000, Math.floor(canvas.width)));
     const step = range / steps;
     ctx.beginPath();
-    ctx.lineWidth = 2;
+    applyElementStrokeStyle(ctx, element, 2);
     ctx.strokeStyle = color;
     let isDrawing = false;
     for (let i = 0; i <= steps; i++) {
@@ -2827,9 +3093,10 @@ function drawParametric(compiled, color) {
         else { ctx.lineTo(sx, sy); }
     }
     ctx.stroke();
+    resetStrokeStyle(ctx);
 }
 
-function drawPolar(compiled, color) {
+function drawPolar(compiled, color, element) {
     const rFn = compiled.rFn;
     const tMin = compiled.thetaMin;
     const tMax = compiled.thetaMax;
@@ -2838,7 +3105,7 @@ function drawPolar(compiled, color) {
     const steps = Math.max(200, Math.min(2000, Math.floor(canvas.width)));
     const step = range / steps;
     ctx.beginPath();
-    ctx.lineWidth = 2;
+    applyElementStrokeStyle(ctx, element, 2);
     ctx.strokeStyle = color;
     let isDrawing = false;
     for (let i = 0; i <= steps; i++) {
@@ -2854,9 +3121,10 @@ function drawPolar(compiled, color) {
         else { ctx.lineTo(sx, sy); }
     }
     ctx.stroke();
+    resetStrokeStyle(ctx);
 }
 
-function drawImplicit(compiled, color) {
+function drawImplicit(compiled, color, element) {
     const fn = compiled.fn;
     const effectiveScale = Math.max(Math.min(state.scaleX, state.scaleY), MIN_SCALE);
     const stepPx = effectiveScale < 20 ? 2 : effectiveScale < 50 ? 3 : 4;
@@ -2865,7 +3133,7 @@ function drawImplicit(compiled, color) {
     const maxX = screenToWorldX(canvas.width);
     const minY = screenToWorldY(canvas.height);
     const maxY = screenToWorldY(0);
-    ctx.lineWidth = 1.5;
+    applyElementStrokeStyle(ctx, element, 1.5);
     ctx.strokeStyle = color;
     for (let x = minX; x < maxX; x += stepWorld) {
         for (let y = minY; y < maxY; y += stepWorld) {
@@ -2896,6 +3164,7 @@ function drawImplicit(compiled, color) {
             }
         }
     }
+    resetStrokeStyle(ctx);
 }
 
 function interpolateEdge(x1, y1, x2, y2, f1, f2) {
@@ -2903,12 +3172,12 @@ function interpolateEdge(x1, y1, x2, y2, f1, f2) {
     return { x: x1 + (x2 - x1) * t, y: y1 + (y2 - y1) * t };
 }
 
-function drawRegion(compiled, color) {
+function drawRegion(compiled, color, element) {
     const fill = hexToRgba(color, 0.25);
     const stroke = hexToRgba(color, 0.85);
     ctx.fillStyle = fill;
     ctx.strokeStyle = stroke;
-    ctx.lineWidth = 1.5;
+    applyElementStrokeStyle(ctx, element, 1.5);
     for (const rect of compiled.rects) {
         const x1 = worldToScreenX(rect.xMin);
         const x2 = worldToScreenX(rect.xMax);
@@ -2921,6 +3190,7 @@ function drawRegion(compiled, color) {
         ctx.fillRect(left, top, width, height);
         ctx.strokeRect(left, top, width, height);
     }
+    resetStrokeStyle(ctx);
 }
 
 function drawTextMarker(el) {
@@ -2965,20 +3235,69 @@ function escapeHtmlAttribute(value) {
         .replace(/'/g, '&#39;');
 }
 
+function formatManualBreakValue(x) {
+    if (!isFinite(x)) return '?';
+    const abs = Math.abs(x);
+    const decimals = abs >= 100 ? 1 : abs >= 10 ? 2 : 3;
+    return parseFloat(x.toFixed(decimals)).toString();
+}
+
 function renderElementsList() {
     const container = document.getElementById('elements-container');
     container.innerHTML = '';
     elements.forEach((el, index) => {
         const div = document.createElement('div');
         const safeContent = escapeHtmlAttribute(String(el.content ?? '').replace(/\r?\n/g, ' '));
-        const safeColor = /^#[0-9a-fA-F]{6}$/.test(String(el.color || '').trim())
-            ? String(el.color).trim()
-            : '#3b82f6';
+        const safeColor = sanitizeHexColor(el.color);
+        const safeStrokeWidth = getElementStrokeWidth(el, DEFAULT_FUNCTION_STROKE_WIDTH).toFixed(1);
+        const safeLineStyle = getElementLineStyle(el);
+        const manualBreaks = getElementManualBreaks(el);
+        const breakPlacementActive = el.type === 'function' && state.breakPlacementElementId === el.id;
+
         div.className = `bg-slate-800 p-2 rounded border-l-4 border-slate-700 mb-2 flex items-center gap-2`;
         div.style.borderLeftColor = safeColor;
+
         let inputHtml = el.type === 'function'
             ? `<input type="text" value="${safeContent}" oninput="updateContent(${index}, this.value)" class="flex-1 bg-slate-900 border-none text-slate-200 text-sm h-8 px-2 rounded font-mono focus:ring-1 focus:ring-blue-500 outline-none" placeholder="y = sin(x) | y = log_{2}(x) | (sin(3t), sin(4t))">`
             : `<input type="text" value="${safeContent}" oninput="updateContent(${index}, this.value)" class="flex-1 bg-slate-900 border-none text-slate-200 text-sm h-8 px-2 rounded font-sans focus:ring-1 focus:ring-emerald-500 outline-none" placeholder="Etiqueta...">`;
+
+        const functionControlsHtml = el.type === 'function'
+            ? `
+                <div class="grid grid-cols-2 gap-2 mt-2">
+                    <div class="bg-slate-900 rounded px-2 py-1.5 border border-slate-700">
+                        <label class="text-[10px] text-slate-500 uppercase font-bold block mb-1">Grosor</label>
+                        <div class="flex items-center gap-2">
+                            <input type="range" min="${MIN_FUNCTION_STROKE_WIDTH}" max="${MAX_FUNCTION_STROKE_WIDTH}" step="0.5" value="${safeStrokeWidth}" oninput="setElementStrokeWidth(${index}, this.value); this.nextElementSibling.textContent = Number(this.value).toFixed(1)" class="w-full accent-blue-500">
+                            <span class="text-[10px] text-slate-400 min-w-[24px] text-right">${safeStrokeWidth}</span>
+                        </div>
+                    </div>
+                    <div class="bg-slate-900 rounded px-2 py-1.5 border border-slate-700">
+                        <label class="text-[10px] text-slate-500 uppercase font-bold block mb-1">Trazo</label>
+                        <select onchange="setElementLineStyle(${index}, this.value)" class="w-full bg-slate-900 text-slate-200 text-xs rounded border border-slate-700 px-1.5 py-1 outline-none focus:ring-1 focus:ring-blue-500">
+                            <option value="solid" ${safeLineStyle === 'solid' ? 'selected' : ''}>Sólida</option>
+                            <option value="dashed" ${safeLineStyle === 'dashed' ? 'selected' : ''}>Discontinua</option>
+                            <option value="dotted" ${safeLineStyle === 'dotted' ? 'selected' : ''}>Punteada</option>
+                            <option value="dashdot" ${safeLineStyle === 'dashdot' ? 'selected' : ''}>Guion-punto</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="mt-2 flex flex-wrap gap-1.5 items-center">
+                    <button type="button" onclick="toggleBreakPlacementMode(${index})" class="text-[10px] px-2 py-1 rounded border ${breakPlacementActive ? 'border-amber-400 text-amber-300 bg-amber-500/10' : 'border-slate-700 text-slate-300 bg-slate-900'} hover:border-amber-400 hover:text-amber-300">
+                        <i class="fa-regular fa-circle-dot"></i> ${breakPlacementActive ? 'Cancelar salto' : 'Añadir salto (clic)'}
+                    </button>
+                    <span class="text-[10px] text-slate-500">${manualBreaks.length} salto${manualBreaks.length === 1 ? '' : 's'}</span>
+                </div>
+                <div class="mt-2 flex flex-wrap gap-1.5">
+                    ${manualBreaks.length
+                        ? manualBreaks.map((point, breakIndex) => `
+                            <button type="button" onclick="removeManualBreak(${index}, ${breakIndex})" class="text-[10px] px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300 hover:border-red-400 hover:text-red-300">
+                                x=${formatManualBreakValue(point.x)} <i class="fa-solid fa-xmark"></i>
+                            </button>
+                        `).join('')
+                        : '<span class="text-[10px] text-slate-500">Sin saltos manuales.</span>'}
+                </div>
+            `
+            : '';
 
         div.innerHTML = `
             <div class="flex flex-col gap-1 w-full">
@@ -2991,6 +3310,7 @@ function renderElementsList() {
                     </div>
                 </div>
                 ${inputHtml}
+                ${functionControlsHtml}
             </div>
         `;
         container.appendChild(div);
@@ -2998,13 +3318,61 @@ function renderElementsList() {
 }
 
 window.updateContent = (i, val) => { elements[i].content = val; delete elements[i]._compiled; scheduleDrawDebounced(); };
-window.removeElement = (i) => { elements.splice(i, 1); renderElementsList(); scheduleDrawFrame(); scheduleSessionSave(); };
-window.toggleVisibility = (i) => { elements[i].visible = !elements[i].visible; renderElementsList(); scheduleDrawFrame(); scheduleSessionSave(); };
+window.removeElement = (i) => {
+    if (!elements[i]) return;
+    const removed = elements[i];
+    elements.splice(i, 1);
+    if (removed.id === state.breakPlacementElementId) {
+        setBreakPlacementElementId(null, false);
+    }
+    renderElementsList();
+    scheduleDrawFrame();
+    scheduleSessionSave();
+};
+window.toggleVisibility = (i) => {
+    if (!elements[i]) return;
+    elements[i].visible = !elements[i].visible;
+    if (elements[i].id === state.breakPlacementElementId && !elements[i].visible) {
+        setBreakPlacementElementId(null, false);
+    }
+    renderElementsList();
+    scheduleDrawFrame();
+    scheduleSessionSave();
+};
 window.setElementColor = (i, color) => {
     if (!elements[i]) return;
-    const value = String(color || '').trim();
-    if (!/^#[0-9a-fA-F]{6}$/.test(value)) return;
+    const value = sanitizeHexColor(color, '');
+    if (!value) return;
     elements[i].color = value;
+    renderElementsList();
+    scheduleDrawFrame();
+    scheduleSessionSave();
+};
+window.setElementStrokeWidth = (i, value) => {
+    if (!elements[i] || elements[i].type !== 'function') return;
+    elements[i].strokeWidth = sanitizeStrokeWidth(value, DEFAULT_FUNCTION_STROKE_WIDTH);
+    scheduleDrawFrame();
+    scheduleSessionSave();
+};
+window.setElementLineStyle = (i, value) => {
+    if (!elements[i] || elements[i].type !== 'function') return;
+    elements[i].lineStyle = sanitizeLineStyle(value);
+    scheduleDrawFrame();
+    scheduleSessionSave();
+};
+window.toggleBreakPlacementMode = (i) => {
+    const el = elements[i];
+    if (!el || el.type !== 'function' || el.visible === false) return;
+    const nextId = state.breakPlacementElementId === el.id ? null : el.id;
+    setBreakPlacementElementId(nextId);
+};
+window.removeManualBreak = (i, breakIndex) => {
+    const el = elements[i];
+    if (!el || el.type !== 'function') return;
+    const breaks = getElementManualBreaks(el);
+    if (breakIndex < 0 || breakIndex >= breaks.length) return;
+    breaks.splice(breakIndex, 1);
+    el.manualBreaks = sanitizeManualBreakList(breaks);
     renderElementsList();
     scheduleDrawFrame();
     scheduleSessionSave();
@@ -3023,7 +3391,7 @@ window.zoomOut = () => {
 };
 window.downloadGraph = downloadGraph;
 
-function drawImplicitToContext(targetCtx, compiled, color) {
+function drawImplicitToContext(targetCtx, compiled, color, element) {
     const fn = compiled.fn;
     const effectiveScale = Math.max(Math.min(state.scaleX, state.scaleY), MIN_SCALE);
     const stepPx = effectiveScale < 20 ? 2 : effectiveScale < 50 ? 3 : 4;
@@ -3032,7 +3400,7 @@ function drawImplicitToContext(targetCtx, compiled, color) {
     const maxX = screenToWorldX(canvas.width);
     const minY = screenToWorldY(canvas.height);
     const maxY = screenToWorldY(0);
-    targetCtx.lineWidth = 1.5;
+    applyElementStrokeStyle(targetCtx, element, 1.5);
     targetCtx.strokeStyle = color;
     for (let x = minX; x < maxX; x += stepWorld) {
         for (let y = minY; y < maxY; y += stepWorld) {
@@ -3071,6 +3439,7 @@ function drawImplicitToContext(targetCtx, compiled, color) {
             }
         }
     }
+    resetStrokeStyle(targetCtx);
 }
 
 function drawGraphElementSync(el) {
@@ -3078,16 +3447,17 @@ function drawGraphElementSync(el) {
     const compiled = getCompiledElement(el);
     if (!compiled || compiled.type === 'invalid') return;
     if (compiled.type === 'function') {
-        drawCartesianFunction(compiled, el.color);
+        drawCartesianFunction(compiled, el.color, el);
         drawFunctionAutoAsymptotes(compiled);
+        drawManualBreakMarkers(compiled, el.color, el);
         return;
     }
     if (compiled.type === 'aux-asymptote') return drawAuxiliaryAsymptote(compiled);
-    if (compiled.type === 'parametric') return drawParametric(compiled, el.color);
-    if (compiled.type === 'polar') return drawPolar(compiled, el.color);
-    if (compiled.type === 'implicit') return drawImplicitToContext(ctx, compiled, el.color);
-    if (compiled.type === 'segments') return compiled.segments.forEach(segment => drawParametric(segment, el.color));
-    if (compiled.type === 'region') return drawRegion(compiled, el.color);
+    if (compiled.type === 'parametric') return drawParametric(compiled, el.color, el);
+    if (compiled.type === 'polar') return drawPolar(compiled, el.color, el);
+    if (compiled.type === 'implicit') return drawImplicitToContext(ctx, compiled, el.color, el);
+    if (compiled.type === 'segments') return compiled.segments.forEach(segment => drawParametric(segment, el.color, el));
+    if (compiled.type === 'region') return drawRegion(compiled, el.color, el);
     if (compiled.type === 'attractor') return drawAttractor(compiled, el.color);
 }
 
